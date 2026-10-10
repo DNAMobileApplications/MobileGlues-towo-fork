@@ -141,4 +141,11 @@ extern "C"
 
 void prepareForDraw();
 
+
+// DroidBridge modern-depth compatibility. The launcher sets the environment
+// marker only for Minecraft 26.2/26.3 MobileGlues launches.
+bool mg_modern_depth_compat_enabled();
+extern thread_local GLenum mg_clip_origin;
+extern thread_local GLenum mg_clip_depth_mode;
+
 #endif // MOBILEGLUES_MG_H

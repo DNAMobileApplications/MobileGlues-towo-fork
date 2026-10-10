@@ -214,6 +214,7 @@ extern "C"
         int GL_EXT_sRGB_write_control;       // GL_FRAMEBUFFER_SRGB
         int GL_NV_polygon_mode;              // GL_POLYGON_OFFSET_LINE / _POINT
         int GL_OES_sample_shading;           // GL_SAMPLE_SHADING before ES 3.2
+        int GL_EXT_clip_control;              // reverse-Z / 0..1 clip depth bridge
         // GL_EXT_multi_draw_arrays deliberately absent: glext.h defines a macro of
         // that exact name, and gl/multidraw.cpp already probes it lazily because it
         // needs the entry points as well as the string.

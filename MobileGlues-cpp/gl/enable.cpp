@@ -291,6 +291,12 @@ void mg_enable_sync_driver(mg_enable_state_t* state) {
     if (state == nullptr || state->driver_synced) return;
     state->driver_synced = true;
 
+    const char* renderer = nullptr;
+    if (GLES.glGetString != nullptr) {
+        renderer = reinterpret_cast<const char*>(GLES.glGetString(GL_RENDERER));
+    }
+    const bool mali_renderer = renderer != nullptr && strstr(renderer, "Mali") != nullptr;
+
     // Without GL_EXT_multisample_compatibility the application cannot turn
     // multisampling off anyway -- it is decided by the EGL config -- so reporting
     // the specification's GL_TRUE on a single-sampled framebuffer would be a lie
@@ -315,6 +321,18 @@ void mg_enable_sync_driver(mg_enable_state_t* state) {
         } else if (GLES.glEnable != nullptr) {
             GLES.glEnable(GL_FRAMEBUFFER_SRGB);
         }
+    }
+
+    if (mali_renderer) {
+        int driver_enabled = -1;
+        if (ext_backing_present(GL_FRAMEBUFFER_SRGB) && GLES.glIsEnabled != nullptr) {
+            driver_enabled = GLES.glIsEnabled(GL_FRAMEBUFFER_SRGB) == GL_TRUE ? 1 : 0;
+        }
+        LOG_W_FORCE("[Color] Mali sRGB state: renderer=%s sRGB_write_control=%d desktopRequested=%d driverEnabled=%d "
+                    "linearWindowFallback=%d",
+                    renderer, g_gles_caps.GL_EXT_sRGB_write_control,
+                    state->scalar[MGC_FRAMEBUFFER_SRGB] == GL_TRUE ? 1 : 0, driver_enabled,
+                    g_gles_caps.GL_EXT_sRGB_write_control == 0 ? 1 : 0)
     }
 }
 

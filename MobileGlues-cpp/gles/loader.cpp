@@ -253,6 +253,8 @@ void InitGLESCapabilities() {
                 g_gles_caps.GL_NV_polygon_mode = 1;
             } else if (strcmp(extension, "GL_OES_sample_shading") == 0) {
                 g_gles_caps.GL_OES_sample_shading = 1;
+            } else if (strcmp(extension, "GL_EXT_clip_control") == 0) {
+                g_gles_caps.GL_EXT_clip_control = 1;
             }
         } else {
             LOG_D("(nullptr)")
@@ -261,10 +263,10 @@ void InitGLESCapabilities() {
 
     LOG_I("%sDetected GL_EXT_multi_draw_indirect!", g_gles_caps.GL_EXT_multi_draw_indirect ? "" : "Not ")
     LOG_I("Enable-capability extensions: multisample_compatibility=%d clip_cull_distance=%d depth_clamp=%d "
-          "sRGB_write_control=%d NV_polygon_mode=%d OES_sample_shading=%d",
+          "sRGB_write_control=%d NV_polygon_mode=%d OES_sample_shading=%d clip_control=%d",
           g_gles_caps.GL_EXT_multisample_compatibility, g_gles_caps.GL_EXT_clip_cull_distance,
           g_gles_caps.GL_EXT_depth_clamp, g_gles_caps.GL_EXT_sRGB_write_control, g_gles_caps.GL_NV_polygon_mode,
-          g_gles_caps.GL_OES_sample_shading)
+          g_gles_caps.GL_OES_sample_shading, g_gles_caps.GL_EXT_clip_control)
 
     if (g_gles_caps.GL_EXT_buffer_storage) {
         AppendExtension("GL_ARB_buffer_storage");
@@ -293,6 +295,11 @@ void InitGLESCapabilities() {
 
     if (g_gles_caps.major > 3 || (g_gles_caps.major == 3 && g_gles_caps.minor >= 1)) {
         AppendExtension("GL_ARB_vertex_attrib_binding");
+    }
+
+    if (mg_modern_depth_compat_enabled() && g_gles_caps.GL_EXT_clip_control) {
+        AppendExtension("GL_ARB_clip_control");
+        LOG_I("[DroidBridge modern depth] GL_ARB_clip_control exposed to Minecraft 26.2+")
     }
 }
 

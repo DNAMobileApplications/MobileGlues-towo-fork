@@ -24,7 +24,7 @@ extern "C"
 #endif
 
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
-                         int& return_code);
+                         int& return_code, std::string* mali_store_only_fallback = nullptr);
 std::string GLSLtoGLSLES_1(const char* glsl_code, GLenum glsl_type, uint esversion, int& return_code);
 std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_version, int& return_code);
 int getGLSLVersion(const char* glsl_code);

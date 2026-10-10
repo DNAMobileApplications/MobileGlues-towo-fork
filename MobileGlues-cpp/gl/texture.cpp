@@ -8,6 +8,7 @@
 #include "texture.h"
 #include "../config/settings.h"
 #include "../egl/context.h"
+#include "envvars.h"
 #include <mutex>
 #include <memory>
 #include <ska/flat_hash_map.hpp>
@@ -237,6 +238,44 @@ struct texture_ctx_state_t {
 };
 
 std::mutex g_tex_mutex;
+// Optional compatibility serialization for workloads that create/delete/bind
+// large numbers of textures through multiple shared GL contexts (notably
+// Distant Horizons + Iris). This is intentionally opt-in because glBindTexture
+// is a hot path and normal workloads do not need the extra lock.
+std::mutex g_safe_texture_bind_mutex;
+
+static bool safe_texture_bind_enabled() {
+    static const bool enabled = IsEnvVarTrue("MG_SAFE_TEXTURE_BIND") != 0;
+    static const bool announced = []() {
+        if (IsEnvVarTrue("MG_SAFE_TEXTURE_BIND")) {
+            LOG_W_FORCE("[MobileGlues] Safe texture binding enabled (MG_SAFE_TEXTURE_BIND=1)")
+            return true;
+        }
+        return false;
+    }();
+    (void)announced;
+    return enabled;
+}
+
+static bool is_legal_bind_texture_target(GLenum target) {
+    switch (target) {
+    case GL_TEXTURE_1D:
+    case GL_TEXTURE_1D_ARRAY:
+    case GL_TEXTURE_2D:
+    case GL_TEXTURE_2D_ARRAY:
+    case GL_TEXTURE_2D_MULTISAMPLE:
+    case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
+    case GL_TEXTURE_3D:
+    case GL_TEXTURE_RECTANGLE:
+    case GL_TEXTURE_CUBE_MAP:
+    case GL_TEXTURE_CUBE_MAP_ARRAY:
+    case GL_TEXTURE_BUFFER:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The tables hold their state by pointer. A thread_local pointer into an entry is
 // the whole point of the design -- the ~90 access sites read through g_bg/g_bc
 // rather than looking anything up -- and the map moves its elements when it
@@ -1488,9 +1527,29 @@ void glBindTexture(GLenum target, GLuint texture) {
     LOG_D("glBindTexture(%s, %d)", glEnumToString(target), texture)
     INIT_CHECK_GL_ERROR
 
+    const bool safeBind = safe_texture_bind_enabled();
+    std::unique_lock<std::mutex> safeLock(g_safe_texture_bind_mutex, std::defer_lock);
+    if (safeBind) safeLock.lock();
+
+    auto targetR = ConvertGLEnumToTextureTarget(target);
+    // glBindTexture does not accept proxy targets or individual cube-map faces.
+    // Passing those straight through to GLES is undefined for this translation
+    // layer and has produced native-driver faults on some Android stacks.
+    if (targetR == TextureTarget::UNKNWON || !is_legal_bind_texture_target(target)) {
+        TX_WARN_ONCE("glBindTexture: rejecting invalid bind target %s (0x%X)",
+                     glEnumToString(target), (unsigned)target);
+        mg_set_gl_error(GL_INVALID_ENUM);
+        return;
+    }
+
+    if (GLES.glBindTexture == nullptr) {
+        TX_WARN_ONCE("glBindTexture: GLES glBindTexture entry point is unavailable");
+        mg_set_gl_error(GL_INVALID_OPERATION);
+        return;
+    }
+
     int currentUnitIndex = GetCurrentTextureUnitIndex();
     auto& currentUnit = GetTextureUnit(currentUnitIndex);
-    auto targetR = ConvertGLEnumToTextureTarget(target);
 
     const bool emulated_buffer_texture =
         hardware && gl_state && hardware->emulate_texture_buffer && target == GL_TEXTURE_BUFFER;
@@ -1501,30 +1560,13 @@ void glBindTexture(GLenum target, GLuint texture) {
     const int driver_unit = emulated_buffer_texture ? MG_TEXTURE_BUFFER_EMULATION_UNIT : DriverActiveTextureUnit;
     const TextureTarget driver_target = emulated_buffer_texture ? TextureTarget::TEXTURE_2D : targetR;
 
-    // Rebinding what is already bound is the single most common redundant call
-    // Minecraft makes, and only the driver call is skipped -- everything below
-    // still runs, because the slot record and TextureObject::target are this
-    // layer's own state and a caller may be re-binding to correct them.
-    //
-    // Both halves are required. The frontend half alone would miss the emulation
-    // above writing a driver slot the application never named, and would trust a
-    // slot record that survived a driver-side change. The driver half alone would
-    // skip the bind that repairs a slot record, and would confuse the buffer
-    // texture on unit 15 with an ordinary 2D texture bound there.
-    //
-    // Who else moves driver texture bindings through GLES.*, and whether it nets
-    // to zero: gl/buffer.cpp's glTexBuffer borrows unit 15, reads its
-    // GL_TEXTURE_BINDING_2D and rebinds the value it read, restoring the active
-    // unit on all three of its exits -- zero. gl/drawing.cpp's
-    // setupBufferTextureUniforms only reads unit 15 and restores the active unit --
-    // zero. This function's own emulation branch is recorded below rather than
-    // left to net out. FSR1's GLStateGuard does not net to zero, which is what
-    // driver_texture_shadow_trustworthy() is for -- as is the shared fallback
-    // record, whose values belong to no context in particular. gl/gl.cpp's
-    // depth-clear triangle and the multidraw backends touch no texture state at
-    // all; bench/ is a separate program.
+    // The normal fast path can suppress a redundant driver bind by consulting
+    // the frontend TextureObject pointer and the driver shadow. Safe mode skips
+    // that optimization entirely. Besides making the driver state authoritative,
+    // this avoids dereferencing a binding-slot pointer while another shared
+    // context may be deleting that texture.
     bool redundant = false;
-    if (targetR != TextureTarget::UNKNWON && driver_texture_shadow_trustworthy()) {
+    if (!safeBind && driver_texture_shadow_trustworthy()) {
         const TextureObject* bound = currentUnit.GetBindingSlot(targetR).GetBoundObject();
         redundant = bound != nullptr && bound->texture == texture &&
                     get_driver_texture_binding(driver_unit, driver_target) == texture;
@@ -1532,6 +1574,11 @@ void glBindTexture(GLenum target, GLuint texture) {
 
     if (!redundant) {
         if (emulated_buffer_texture) {
+            if (GLES.glActiveTexture == nullptr) {
+                TX_WARN_ONCE("glBindTexture: GLES glActiveTexture entry point is unavailable for texture-buffer emulation");
+                mg_set_gl_error(GL_INVALID_OPERATION);
+                return;
+            }
             GLES.glActiveTexture(GL_TEXTURE0 + MG_TEXTURE_BUFFER_EMULATION_UNIT);
             GLES.glBindTexture(GL_TEXTURE_2D, texture);
             GLES.glActiveTexture(GL_TEXTURE0 + gl_state->current_tex_unit);
@@ -1543,10 +1590,6 @@ void glBindTexture(GLenum target, GLuint texture) {
     }
     CHECK_GL_ERROR_NO_INIT
 
-    if (targetR == TextureTarget::UNKNWON) {
-        LOG_E("glBindTexture: Unknown texture target: %s", glEnumToString(target));
-        return;
-    }
     auto& bindingSlot = currentUnit.GetBindingSlot(targetR);
     auto textureObject = GetOrCreateTextureObject(texture);
     if (!textureObject) {
@@ -1560,6 +1603,8 @@ void glBindTexture(GLenum target, GLuint texture) {
 void glDeleteTextures(GLsizei n, const GLuint* textures) {
     LOG()
     INIT_CHECK_GL_ERROR
+    std::unique_lock<std::mutex> safeLock(g_safe_texture_bind_mutex, std::defer_lock);
+    if (safe_texture_bind_enabled()) safeLock.lock();
     GLES.glDeleteTextures(n, textures);
     CHECK_GL_ERROR_NO_INIT
 

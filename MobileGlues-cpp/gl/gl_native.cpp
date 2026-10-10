@@ -58,7 +58,12 @@ NATIVE_FUNCTION_HEAD(void, glDisableVertexAttribArray, GLuint index) NATIVE_FUNC
 NATIVE_FUNCTION_HEAD(void, glDrawArrays, GLenum mode, GLint first, GLsizei count) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawArrays, mode,first,count)
 //NATIVE_FUNCTION_HEAD(void, glDrawElements, GLenum mode, GLsizei count, GLenum type, const void *indices) NATIVE_FUNCTION_END_NO_RETURN(void, glDrawElements, mode,count,type,indices)
 // NATIVE_FUNCTION_HEAD(void, glEnable, GLenum cap) NATIVE_FUNCTION_END_NO_RETURN(void, glEnable, cap)   // moved to gl/enable.cpp (virtual enable state table)
-NATIVE_FUNCTION_HEAD(void, glEnableVertexAttribArray, GLuint index) NATIVE_FUNCTION_END_NO_RETURN(void, glEnableVertexAttribArray, index)
+NATIVE_FUNCTION_HEAD(void, glEnableVertexAttribArray, GLuint index)
+    static thread_local int dh262_evaa_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_evaa_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glEnableVertexAttribArray attrib=%u", index)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glEnableVertexAttribArray, index)
 NATIVE_FUNCTION_HEAD(void, glFinish) NATIVE_FUNCTION_END_NO_RETURN(void, glFinish)
 NATIVE_FUNCTION_HEAD(void, glFlush) NATIVE_FUNCTION_END_NO_RETURN(void, glFlush)
 // NATIVE_FUNCTION_HEAD(void, glFramebufferRenderbuffer, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) NATIVE_FUNCTION_END_NO_RETURN(void, glFramebufferRenderbuffer, target,attachment,renderbuffertarget,renderbuffer)   // implemented in gl/framebuffer.cpp
@@ -243,7 +248,12 @@ NATIVE_FUNCTION_HEAD(void, glSamplerParameterf, GLuint sampler, GLenum pname, GL
 NATIVE_FUNCTION_HEAD(void, glSamplerParameterfv, GLuint sampler, GLenum pname, const GLfloat *param) NATIVE_FUNCTION_END_NO_RETURN(void, glSamplerParameterfv, sampler,pname,param)
 NATIVE_FUNCTION_HEAD(void, glGetSamplerParameteriv, GLuint sampler, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSamplerParameteriv, sampler,pname,params)
 NATIVE_FUNCTION_HEAD(void, glGetSamplerParameterfv, GLuint sampler, GLenum pname, GLfloat *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetSamplerParameterfv, sampler,pname,params)
-NATIVE_FUNCTION_HEAD(void, glVertexAttribDivisor, GLuint index, GLuint divisor) NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribDivisor, index,divisor)
+NATIVE_FUNCTION_HEAD(void, glVertexAttribDivisor, GLuint index, GLuint divisor)
+    static thread_local int dh262_vad_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_vad_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glVertexAttribDivisor attrib=%u divisor=%u", index, divisor)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribDivisor, index,divisor)
 NATIVE_FUNCTION_HEAD(void, glBindTransformFeedback, GLenum target, GLuint id) NATIVE_FUNCTION_END_NO_RETURN(void, glBindTransformFeedback, target,id)
 NATIVE_FUNCTION_HEAD(void, glDeleteTransformFeedbacks, GLsizei n, const GLuint *ids) NATIVE_FUNCTION_END_NO_RETURN(void, glDeleteTransformFeedbacks, n,ids)
 NATIVE_FUNCTION_HEAD(void, glGenTransformFeedbacks, GLsizei n, GLuint *ids) NATIVE_FUNCTION_END_NO_RETURN(void, glGenTransformFeedbacks, n,ids)
@@ -322,10 +332,34 @@ NATIVE_FUNCTION_HEAD(void, glSampleMaski, GLuint maskNumber, GLbitfield mask) NA
 //NATIVE_FUNCTION_HEAD(void, glGetTexLevelParameteriv, GLenum target, GLint level, GLenum pname, GLint *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetTexLevelParameteriv, target,level,pname,params)
 //NATIVE_FUNCTION_HEAD(void, glGetTexLevelParameterfv, GLenum target, GLint level, GLenum pname, GLfloat *params) NATIVE_FUNCTION_END_NO_RETURN(void, glGetTexLevelParameterfv, target,level,pname,params)
 //NATIVE_FUNCTION_HEAD(void, glBindVertexBuffer, GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) NATIVE_FUNCTION_END_NO_RETURN(void, glBindVertexBuffer, bindingindex,buffer,offset,stride)
-NATIVE_FUNCTION_HEAD(void, glVertexAttribFormat, GLuint attribindex, GLint size, GLenum type, GLboolean normalized, GLuint relativeoffset) NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribFormat, attribindex,size,type,normalized,relativeoffset)
-NATIVE_FUNCTION_HEAD(void, glVertexAttribIFormat, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset) NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribIFormat, attribindex,size,type,relativeoffset)
-NATIVE_FUNCTION_HEAD(void, glVertexAttribBinding, GLuint attribindex, GLuint bindingindex) NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribBinding, attribindex,bindingindex)
-NATIVE_FUNCTION_HEAD(void, glVertexBindingDivisor, GLuint bindingindex, GLuint divisor) NATIVE_FUNCTION_END_NO_RETURN(void, glVertexBindingDivisor, bindingindex,divisor)
+NATIVE_FUNCTION_HEAD(void, glVertexAttribFormat, GLuint attribindex, GLint size, GLenum type, GLboolean normalized, GLuint relativeoffset)
+    static thread_local int dh262_vaf_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_vaf_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glVertexAttribFormat attrib=%u size=%d type=0x%x norm=%d relOffset=%u",
+                    attribindex, size, type, normalized ? 1 : 0, relativeoffset)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribFormat, attribindex,size,type,normalized,relativeoffset)
+NATIVE_FUNCTION_HEAD(void, glVertexAttribIFormat, GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset)
+    static thread_local int dh262_vaif_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_vaif_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glVertexAttribIFormat attrib=%u size=%d type=0x%x relOffset=%u",
+                    attribindex, size, type, relativeoffset)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribIFormat, attribindex,size,type,relativeoffset)
+NATIVE_FUNCTION_HEAD(void, glVertexAttribBinding, GLuint attribindex, GLuint bindingindex)
+    static thread_local int dh262_vab_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_vab_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glVertexAttribBinding attrib=%u binding=%u",
+                    attribindex, bindingindex)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glVertexAttribBinding, attribindex,bindingindex)
+NATIVE_FUNCTION_HEAD(void, glVertexBindingDivisor, GLuint bindingindex, GLuint divisor)
+    static thread_local int dh262_vbd_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_vbd_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glVertexBindingDivisor binding=%u divisor=%u",
+                    bindingindex, divisor)
+    }
+NATIVE_FUNCTION_END_NO_RETURN(void, glVertexBindingDivisor, bindingindex,divisor)
 NATIVE_FUNCTION_HEAD(void, glBlendBarrier) NATIVE_FUNCTION_END_NO_RETURN(void, glBlendBarrier)
 NATIVE_FUNCTION_HEAD(void, glCopyImageSubData, GLuint srcName, GLenum srcTarget, GLint srcLevel, GLint srcX, GLint srcY, GLint srcZ, GLuint dstName, GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ, GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth) NATIVE_FUNCTION_END_NO_RETURN(void, glCopyImageSubData, srcName,srcTarget,srcLevel,srcX,srcY,srcZ,dstName,dstTarget,dstLevel,dstX,dstY,dstZ,srcWidth,srcHeight,srcDepth)
 NATIVE_FUNCTION_HEAD(void, glDebugMessageControl, GLenum source, GLenum type, GLenum severity, GLsizei count, const GLuint *ids, GLboolean enabled) NATIVE_FUNCTION_END_NO_RETURN(void, glDebugMessageControl, source,type,severity,count,ids,enabled)

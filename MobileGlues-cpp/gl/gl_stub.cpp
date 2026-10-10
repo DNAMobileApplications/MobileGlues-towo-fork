@@ -49,7 +49,6 @@ STUB_FUNCTION_HEAD(GLint, glRenderMode, GLenum mode) STUB_FUNCTION_END(GLint, gl
 * Depth Buffer
 */
 
-STUB_FUNCTION_HEAD(void, glDepthRange, GLclampd near_val, GLclampd far_val ) STUB_FUNCTION_END_NO_RETURN(void, glDepthRange, near_val, far_val)
 /*
 * Accumulation Buffer
 */
@@ -650,7 +649,6 @@ STUB_FUNCTION_HEAD(void, glBindBuffersRange, GLenum target, GLuint first, GLsize
 //STUB_FUNCTION_HEAD(void, glBindSamplers, GLuint first, GLsizei count, const GLuint* samplers); STUB_FUNCTION_END_NO_RETURN(void, glBindSamplers,first,count,samplers)
 //STUB_FUNCTION_HEAD(void, glBindImageTextures, GLuint first, GLsizei count, const GLuint* textures); STUB_FUNCTION_END_NO_RETURN(void, glBindImageTextures,first,count,textures)
 //STUB_FUNCTION_HEAD(void, glBindVertexBuffers, GLuint first, GLsizei count, const GLuint* buffers, const GLintptr* offsets, const GLsizei* strides); STUB_FUNCTION_END_NO_RETURN(void, glBindVertexBuffers,first,count,buffers,offsets,strides)
-STUB_FUNCTION_HEAD(void, glClipControl, GLenum origin, GLenum depth); STUB_FUNCTION_END_NO_RETURN(void, glClipControl,origin,depth)
 //STUB_FUNCTION_HEAD(void, glCreateTransformFeedbacks, GLsizei n, GLuint* ids); STUB_FUNCTION_END_NO_RETURN(void, glCreateTransformFeedbacks,n,ids)
 //STUB_FUNCTION_HEAD(void, glTransformFeedbackBufferBase, GLuint xfb, GLuint index, GLuint buffer); STUB_FUNCTION_END_NO_RETURN(void, glTransformFeedbackBufferBase,xfb,index,buffer)
 //STUB_FUNCTION_HEAD(void, glTransformFeedbackBufferRange, GLuint xfb, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size); STUB_FUNCTION_END_NO_RETURN(void, glTransformFeedbackBufferRange,xfb,index,buffer,offset,size)

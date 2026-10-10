@@ -8,6 +8,7 @@
 #include "egl.h"
 #include "context.h"
 #include "../config/settings.h"
+#include "../config/gpu_utils.h"
 #include "../gl/FSR1/FSR1.h"
 #include "../gl/log.h"
 #include "../gl/mg.h"
@@ -35,6 +36,92 @@ namespace {
 
     thread_local EGLenum frontend_api = EGL_OPENGL_ES_API;
     thread_local EGLint frontend_error = EGL_SUCCESS;
+
+    // Desktop OpenGL starts GL_FRAMEBUFFER_SRGB disabled. On GLES, when
+    // GL_EXT_sRGB_write_control is absent, an sRGB window surface can still
+    // perform the linear->sRGB conversion unconditionally. That produces the
+    // washed-out/high-gamma presentation seen on Mali devices while Adreno
+    // devices (which expose sRGB_write_control) look correct.
+    //
+    // For Mali only, and only when the backend cannot expose
+    // GL_EXT_sRGB_write_control, make the *window* surface linear unless the
+    // application explicitly requested a colorspace. Off-screen FBOs and every
+    // non-Mali backend are untouched.
+    bool maliNeedsLinearWindowSurface() {
+        static const bool is_mali = []() {
+            const std::string gpu = getGPUInfo();
+            return gpu.find("Mali") != std::string::npos;
+        }();
+        return is_mali && g_gles_caps.GL_EXT_sRGB_write_control == 0;
+    }
+
+    bool hasEglIntAttribute(const EGLint* attrib_list, EGLint wanted) {
+        if (!attrib_list) return false;
+        for (size_t pair = 0; pair < kMaxEglAttributePairs; ++pair) {
+            const EGLint attr = attrib_list[pair * 2];
+            if (attr == EGL_NONE) return false;
+            if (attr == wanted) return true;
+        }
+        return false;
+    }
+
+    bool hasEglAttribAttribute(const EGLAttrib* attrib_list, EGLAttrib wanted) {
+        if (!attrib_list) return false;
+        for (size_t pair = 0; pair < kMaxEglAttributePairs; ++pair) {
+            const EGLAttrib attr = attrib_list[pair * 2];
+            if (attr == EGL_NONE) return false;
+            if (attr == wanted) return true;
+        }
+        return false;
+    }
+
+    std::vector<EGLint> makeMaliLinearWindowAttributes(const EGLint* attrib_list, bool* changed) {
+        std::vector<EGLint> out;
+        *changed = false;
+        if (!maliNeedsLinearWindowSurface() || hasEglIntAttribute(attrib_list, EGL_GL_COLORSPACE_KHR)) return out;
+
+        if (attrib_list) {
+            for (size_t pair = 0; pair < kMaxEglAttributePairs; ++pair) {
+                const EGLint attr = attrib_list[pair * 2];
+                if (attr == EGL_NONE) break;
+                out.push_back(attr);
+                out.push_back(attrib_list[pair * 2 + 1]);
+            }
+        }
+        out.push_back(EGL_GL_COLORSPACE_KHR);
+        out.push_back(EGL_GL_COLORSPACE_LINEAR_KHR);
+        out.push_back(EGL_NONE);
+        *changed = true;
+        return out;
+    }
+
+    std::vector<EGLAttrib> makeMaliLinearWindowAttributesAttrib(const EGLAttrib* attrib_list, bool* changed) {
+        std::vector<EGLAttrib> out;
+        *changed = false;
+        if (!maliNeedsLinearWindowSurface() || hasEglAttribAttribute(attrib_list, EGL_GL_COLORSPACE_KHR)) return out;
+
+        if (attrib_list) {
+            for (size_t pair = 0; pair < kMaxEglAttributePairs; ++pair) {
+                const EGLAttrib attr = attrib_list[pair * 2];
+                if (attr == EGL_NONE) break;
+                out.push_back(attr);
+                out.push_back(attrib_list[pair * 2 + 1]);
+            }
+        }
+        out.push_back(EGL_GL_COLORSPACE_KHR);
+        out.push_back(EGL_GL_COLORSPACE_LINEAR_KHR);
+        out.push_back(EGL_NONE);
+        *changed = true;
+        return out;
+    }
+
+    void logMaliLinearWindowSurfaceOnce() {
+        static bool logged = false;
+        if (logged) return;
+        logged = true;
+        LOG_W_FORCE("[Color] Mali without GL_EXT_sRGB_write_control: forcing EGL window surface colorspace to LINEAR "
+                    "to match desktop GL's initial GL_FRAMEBUFFER_SRGB=false semantics.")
+    }
 
     // Held across "call the backend, then record what it did", in both directions.
     //
@@ -612,6 +699,21 @@ extern "C"
                                               const EGLint* attrib_list) {
         LOG_D("eglCreateWindowSurface, dpy: %p, config: %p, win: %p, attrib_list: %p", dpy, config, win, attrib_list);
         LOAD_EGL(eglCreateWindowSurface)
+
+        bool changed = false;
+        const std::vector<EGLint> linear = makeMaliLinearWindowAttributes(attrib_list, &changed);
+        if (!changed) return egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
+
+        logMaliLinearWindowSurfaceOnce();
+        EGLSurface surface = egl_eglCreateWindowSurface(dpy, config, win, linear.data());
+        if (surface != EGL_NO_SURFACE) return surface;
+
+        // Never turn the compatibility attempt into a startup regression.
+        // Consume the backend error and retry the application's exact attributes.
+        LOAD_EGL(eglGetError)
+        const EGLint color_error = egl_eglGetError ? egl_eglGetError() : EGL_SUCCESS;
+        LOG_W_FORCE("[Color] Mali LINEAR window-surface request failed (EGL error=0x%x); retrying original attributes.",
+                    color_error)
         return egl_eglCreateWindowSurface(dpy, config, win, attrib_list);
     }
 
@@ -898,6 +1000,19 @@ extern "C"
         LOG_D("eglCreatePlatformWindowSurface, dpy: %p, config: %p, native_window: %p, attrib_list: %p", dpy, config,
               native_window, attrib_list);
         LOAD_EGL_OR(eglCreatePlatformWindowSurface, setFrontendError(EGL_BAD_PARAMETER), EGL_NO_SURFACE)
+
+        bool changed = false;
+        const std::vector<EGLAttrib> linear = makeMaliLinearWindowAttributesAttrib(attrib_list, &changed);
+        if (!changed) return egl_eglCreatePlatformWindowSurface(dpy, config, native_window, attrib_list);
+
+        logMaliLinearWindowSurfaceOnce();
+        EGLSurface surface = egl_eglCreatePlatformWindowSurface(dpy, config, native_window, linear.data());
+        if (surface != EGL_NO_SURFACE) return surface;
+
+        LOAD_EGL(eglGetError)
+        const EGLint color_error = egl_eglGetError ? egl_eglGetError() : EGL_SUCCESS;
+        LOG_W_FORCE("[Color] Mali LINEAR platform window-surface request failed (EGL error=0x%x); retrying original attributes.",
+                    color_error)
         return egl_eglCreatePlatformWindowSurface(dpy, config, native_window, attrib_list);
     }
 
@@ -921,6 +1036,19 @@ extern "C"
         LOG_D("eglCreatePlatformWindowSurfaceEXT, dpy: %p, config: %p, native_window: %p, attrib_list: %p", dpy, config,
               native_window, attrib_list);
         LOAD_EGL_OR(eglCreatePlatformWindowSurfaceEXT, setFrontendError(EGL_BAD_PARAMETER), EGL_NO_SURFACE)
+
+        bool changed = false;
+        const std::vector<EGLint> linear = makeMaliLinearWindowAttributes(attrib_list, &changed);
+        if (!changed) return egl_eglCreatePlatformWindowSurfaceEXT(dpy, config, native_window, attrib_list);
+
+        logMaliLinearWindowSurfaceOnce();
+        EGLSurface surface = egl_eglCreatePlatformWindowSurfaceEXT(dpy, config, native_window, linear.data());
+        if (surface != EGL_NO_SURFACE) return surface;
+
+        LOAD_EGL(eglGetError)
+        const EGLint color_error = egl_eglGetError ? egl_eglGetError() : EGL_SUCCESS;
+        LOG_W_FORCE("[Color] Mali LINEAR platform-EXT window-surface request failed (EGL error=0x%x); retrying original attributes.",
+                    color_error)
         return egl_eglCreatePlatformWindowSurfaceEXT(dpy, config, native_window, attrib_list);
     }
 

@@ -249,7 +249,33 @@ std::string process_uniform_declarations(const std::string& glslCode) {
     result.reserve(glslCode.length());
 
     while (scan_pos < length) {
-        if (glslCode.compare(scan_pos, 7, "uniform") == 0) {
+        // Do not parse tokens inside comments. Besides being more correct, this
+        // prevents shader comments containing words such as "uniform" or
+        // "uniformly" from being mistaken for declarations.
+        if (scan_pos + 1 < length && glslCode[scan_pos] == '/' && glslCode[scan_pos + 1] == '/') {
+            const size_t newline = glslCode.find('\n', scan_pos + 2);
+            scan_pos = (newline == std::string::npos) ? length : newline + 1;
+            continue;
+        }
+        if (scan_pos + 1 < length && glslCode[scan_pos] == '/' && glslCode[scan_pos + 1] == '*') {
+            const size_t endComment = glslCode.find("*/", scan_pos + 2);
+            scan_pos = (endComment == std::string::npos) ? length : endComment + 2;
+            continue;
+        }
+
+        // Only treat "uniform" as the GLSL keyword. Snapshot 9 uses generated
+        // identifiers such as "_uniform"; matching the substring inside an
+        // identifier corrupts the shader and produces "_uniform undeclared".
+        const bool uniformKeyword =
+            glslCode.compare(scan_pos, 7, "uniform") == 0 &&
+            (scan_pos == 0 ||
+             !(std::isalnum(static_cast<unsigned char>(glslCode[scan_pos - 1])) ||
+               glslCode[scan_pos - 1] == '_')) &&
+            (scan_pos + 7 >= length ||
+             !(std::isalnum(static_cast<unsigned char>(glslCode[scan_pos + 7])) ||
+               glslCode[scan_pos + 7] == '_'));
+
+        if (uniformKeyword) {
             if (scan_pos > chunk_start) {
                 result.append(glslCode, chunk_start, scan_pos - chunk_start);
             }
@@ -308,6 +334,75 @@ std::string process_uniform_declarations(const std::string& glslCode) {
 
             while (scan_pos < length && std::isspace(glslCode[scan_pos]))
                 ++scan_pos;
+
+            // SPIRV-Cross can emit uniform blocks, for example:
+            //
+            //   uniform _uniform {
+            //       mat4 _instance_00_00;
+            //   } _uniform;
+            //
+            // The old simple-uniform parser treated the first member semicolon
+            // as the end of the declaration and destroyed the block. Snapshot 9
+            // terrain shaders then referenced an undeclared `_uniform` block.
+            // Preserve block declarations byte-for-byte.
+            if (scan_pos < length && glslCode[scan_pos] == '{') {
+                size_t pos = scan_pos;
+                int braceDepth = 0;
+                bool inLineComment = false;
+                bool inBlockComment = false;
+
+                while (pos < length) {
+                    if (inLineComment) {
+                        if (glslCode[pos] == '\n') inLineComment = false;
+                        ++pos;
+                        continue;
+                    }
+                    if (inBlockComment) {
+                        if (pos + 1 < length && glslCode[pos] == '*' && glslCode[pos + 1] == '/') {
+                            inBlockComment = false;
+                            pos += 2;
+                        } else {
+                            ++pos;
+                        }
+                        continue;
+                    }
+                    if (pos + 1 < length && glslCode[pos] == '/' && glslCode[pos + 1] == '/') {
+                        inLineComment = true;
+                        pos += 2;
+                        continue;
+                    }
+                    if (pos + 1 < length && glslCode[pos] == '/' && glslCode[pos + 1] == '*') {
+                        inBlockComment = true;
+                        pos += 2;
+                        continue;
+                    }
+
+                    if (glslCode[pos] == '{') {
+                        ++braceDepth;
+                    } else if (glslCode[pos] == '}') {
+                        --braceDepth;
+                        if (braceDepth == 0) {
+                            ++pos; // include closing brace
+                            break;
+                        }
+                    }
+                    ++pos;
+                }
+
+                // Include optional instance name / array suffix up to the block's
+                // terminating semicolon.
+                size_t blockEnd = glslCode.find(';', pos);
+                if (blockEnd == std::string::npos) {
+                    blockEnd = length;
+                } else {
+                    ++blockEnd;
+                }
+
+                result.append(glslCode, decl_start, blockEnd - decl_start);
+                scan_pos = chunk_start = blockEnd;
+                continue;
+            }
+
             const size_t name_start = scan_pos;
             while (scan_pos < length && (std::isalnum(glslCode[scan_pos]) || glslCode[scan_pos] == '_')) {
                 ++scan_pos;
@@ -346,13 +441,777 @@ std::string processOutColorLocations(const std::string& glslCode) {
     return std::regex_replace(glslCode, pattern, replacement);
 }
 
+
+// Some Mali GLES compilers reject dynamically indexed fragment-output arrays,
+// even when the ESSL source produced by SPIRV-Cross is otherwise valid.  This
+// is exposed by Minecraft 26.3's OIT transmittance shaders as:
+//
+//   S0015: Outputs declared as arrays may only be indexed by a constant
+//          integral expression.
+//
+// Adreno accepts the generated shader, so keep this workaround Mali-only.  We
+// deliberately patch the final ESSL rather than Minecraft's input GLSL: this is
+// the exact representation the GLES driver sees, and it also covers future
+// callers that hit the same SPIRV-Cross lowering pattern.
+static bool isMaliRendererForOutputArrayWorkaround() {
+    static int cached = -1;
+    if (cached >= 0) return cached == 1;
+
+    if (!GLES.glGetString) return false;
+    const GLubyte* rendererBytes = GLES.glGetString(GL_RENDERER);
+    if (!rendererBytes) return false; // Context may not be current yet; retry later.
+
+    std::string renderer(reinterpret_cast<const char*>(rendererBytes));
+    std::string lowered = renderer;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    cached = lowered.find("mali") != std::string::npos ? 1 : 0;
+    if (cached == 1) {
+        LOG_I("[Shader] Mali renderer detected; dynamic fragment output-array compatibility enabled (%s).",
+              renderer.c_str())
+    }
+    return cached == 1;
+}
+
+static std::string trimCopy(const std::string& value) {
+    const size_t begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) return "";
+    const size_t end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+static bool isMaliIdentStart(char c) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    return std::isalpha(u) || c == '_';
+}
+
+static bool isMaliIdentChar(char c) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    return std::isalnum(u) || c == '_';
+}
+
+static bool isIntegralConstantExpression(const std::string& expression) {
+    std::string value = trimCopy(expression);
+    if (value.empty()) return false;
+
+    size_t i = 0;
+    if (value[i] == '+' || value[i] == '-') {
+        if (++i >= value.size()) return false;
+    }
+
+    bool hex = false;
+    if (i + 2 <= value.size() && value[i] == '0' && i + 1 < value.size() &&
+        (value[i + 1] == 'x' || value[i + 1] == 'X')) {
+        hex = true;
+        i += 2;
+        if (i >= value.size()) return false;
+    }
+
+    size_t digits = 0;
+    for (; i < value.size(); ++i) {
+        const char c = value[i];
+        if (c == 'u' || c == 'U') {
+            return digits > 0 && i + 1 == value.size();
+        }
+        const unsigned char u = static_cast<unsigned char>(c);
+        const bool valid = hex ? std::isxdigit(u) != 0 : std::isdigit(u) != 0;
+        if (!valid) return false;
+        ++digits;
+    }
+    return digits > 0;
+}
+
+static bool parseMaliPositiveExtentLiteral(const std::string& expression, unsigned int* valueOut) {
+    std::string value = trimCopy(expression);
+    if (value.empty()) return false;
+    if (value.back() == 'u' || value.back() == 'U') value.pop_back();
+    if (value.empty()) return false;
+    for (char c : value) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    }
+    try {
+        const unsigned long parsed = std::stoul(value);
+        if (parsed == 0 || parsed > 32) return false;
+        if (valueOut) *valueOut = static_cast<unsigned int>(parsed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool isIdentifierBoundary(const std::string& text, size_t pos) {
+    return pos >= text.size() || !isMaliIdentChar(text[pos]);
+}
+
+static unsigned int resolveMaliNamedExtent(const std::string& essl, const std::string& name) {
+    if (name.empty() || !isMaliIdentStart(name[0])) return 0;
+    for (char c : name) if (!isMaliIdentChar(c)) return 0;
+
+    size_t pos = 0;
+    while ((pos = essl.find(name, pos)) != std::string::npos) {
+        const bool leftOk = pos == 0 || !isMaliIdentChar(essl[pos - 1]);
+        const bool rightOk = isIdentifierBoundary(essl, pos + name.size());
+        if (!leftOk || !rightOk) {
+            pos += name.size();
+            continue;
+        }
+
+        const size_t lineStartPos = essl.rfind('\n', pos);
+        const size_t lineStart = lineStartPos == std::string::npos ? 0 : lineStartPos + 1;
+        const size_t lineEndPos = essl.find('\n', pos);
+        const size_t lineEnd = lineEndPos == std::string::npos ? essl.size() : lineEndPos;
+        const std::string line = essl.substr(lineStart, lineEnd - lineStart);
+        const size_t localName = pos - lineStart;
+
+        // #define NAME 4
+        const size_t definePos = line.find("#define");
+        if (definePos != std::string::npos && definePos < localName) {
+            size_t rhs = localName + name.size();
+            while (rhs < line.size() && std::isspace(static_cast<unsigned char>(line[rhs]))) ++rhs;
+            size_t rhsEnd = rhs;
+            while (rhsEnd < line.size() && !std::isspace(static_cast<unsigned char>(line[rhsEnd]))) ++rhsEnd;
+            unsigned int parsed = 0;
+            if (parseMaliPositiveExtentLiteral(line.substr(rhs, rhsEnd - rhs), &parsed)) return parsed;
+        }
+
+        // const int/uint NAME = 4;
+        const size_t constPos = line.find("const");
+        const size_t eqPos = line.find('=', localName + name.size());
+        if (constPos != std::string::npos && constPos < localName && eqPos != std::string::npos) {
+            size_t rhs = eqPos + 1;
+            while (rhs < line.size() && std::isspace(static_cast<unsigned char>(line[rhs]))) ++rhs;
+            size_t rhsEnd = rhs;
+            while (rhsEnd < line.size() && line[rhsEnd] != ';' &&
+                   !std::isspace(static_cast<unsigned char>(line[rhsEnd]))) ++rhsEnd;
+            unsigned int parsed = 0;
+            if (parseMaliPositiveExtentLiteral(line.substr(rhs, rhsEnd - rhs), &parsed)) return parsed;
+        }
+
+        pos += name.size();
+    }
+    return 0;
+}
+
+static bool containsMaliTokenInRange(const std::string& text, size_t begin, size_t end,
+                                     const std::string& token);
+
+static unsigned int resolveMaliOutputArrayExtent(const std::string& essl, const std::string& rawExpression) {
+    const std::string expression = trimCopy(rawExpression);
+    if (expression.empty()) return 0;
+
+    unsigned int literal = 0;
+    if (parseMaliPositiveExtentLiteral(expression, &literal)) return literal;
+
+    if (expression == "gl_MaxDrawBuffers") {
+        GLint maxDrawBuffers = 0;
+        if (GLES.glGetIntegerv) GLES.glGetIntegerv(GL_MAX_DRAW_BUFFERS, &maxDrawBuffers);
+        if (maxDrawBuffers <= 0) maxDrawBuffers = 8;
+        if (maxDrawBuffers > 32) maxDrawBuffers = 32;
+        return static_cast<unsigned int>(maxDrawBuffers);
+    }
+
+    return resolveMaliNamedExtent(essl, expression);
+}
+
+// Mali's fragment-output rule is about *runtime* indexing.  A named #define or
+// const int is still a compile-time integral constant, even though the simple
+// literal parser above cannot recognize it by itself.  Treat those as constants
+// so the dynamic-access pass never rewrites array declarations such as
+// `out vec4 color[SPIRV_Cross_Combined_MAX];` into an expression.
+static bool isMaliCompileTimeConstantIndex(const std::string& essl, const std::string& rawExpression) {
+    std::string expression = trimCopy(rawExpression);
+    if (expression.empty()) return false;
+
+    // Strip harmless balanced outer parentheses.
+    bool changed = true;
+    while (changed && expression.size() >= 2 && expression.front() == '(' && expression.back() == ')') {
+        changed = false;
+        int depth = 0;
+        bool wrapsWholeExpression = true;
+        for (size_t i = 0; i < expression.size(); ++i) {
+            if (expression[i] == '(') ++depth;
+            else if (expression[i] == ')') --depth;
+            if (depth == 0 && i + 1 < expression.size()) {
+                wrapsWholeExpression = false;
+                break;
+            }
+        }
+        if (wrapsWholeExpression) {
+            expression = trimCopy(expression.substr(1, expression.size() - 2));
+            changed = true;
+        }
+    }
+
+    if (isIntegralConstantExpression(expression)) return true;
+    if (expression == "gl_MaxDrawBuffers") return true;
+    return resolveMaliNamedExtent(essl, expression) > 0;
+}
+
+static bool isMaliOutputArrayDeclarator(const std::string& source, size_t pathStart,
+                                        size_t closeBracket, const std::string& indexExpression) {
+    // A declaration is the most important false-positive to reject.  SPIRV-Cross
+    // commonly emits symbolic extents, and the old scanner interpreted the
+    // declaration bracket as one dynamic read.  Do not require us to resolve the
+    // extent here; declaration syntax itself is sufficient to prove this is not
+    // a runtime array access.
+    (void) indexExpression;
+
+    size_t after = closeBracket + 1;
+    while (after < source.size() && std::isspace(static_cast<unsigned char>(source[after]))) ++after;
+    if (after >= source.size() || (source[after] != ';' && source[after] != ',' && source[after] != '='))
+        return false;
+
+    const size_t lineStartPos = source.rfind('\n', pathStart);
+    const size_t lineStart = lineStartPos == std::string::npos ? 0 : lineStartPos + 1;
+    if (containsMaliTokenInRange(source, lineStart, pathStart, "out")) return true;
+
+    // Interface-block members do not repeat the `out` qualifier on every line.
+    const size_t openBrace = source.rfind('{', pathStart);
+    const size_t closeBrace = source.rfind('}', pathStart);
+    if (openBrace != std::string::npos && (closeBrace == std::string::npos || openBrace > closeBrace)) {
+        size_t headerStart = source.rfind(';', openBrace);
+        const size_t headerLine = source.rfind('\n', openBrace);
+        if (headerStart == std::string::npos || (headerLine != std::string::npos && headerLine > headerStart))
+            headerStart = headerLine;
+        headerStart = headerStart == std::string::npos ? 0 : headerStart + 1;
+        if (containsMaliTokenInRange(source, headerStart, openBrace, "out")) return true;
+    }
+    return false;
+}
+
+static std::string normalizeMaliAccessPath(const std::string& path) {
+    std::string out;
+    out.reserve(path.size());
+    bool pendingSpace = false;
+    for (char c : path) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            pendingSpace = true;
+            continue;
+        }
+        if (c == '.') {
+            while (!out.empty() && out.back() == ' ') out.pop_back();
+            out.push_back('.');
+            pendingSpace = false;
+            continue;
+        }
+        if (pendingSpace && !out.empty() && out.back() != '.') out.push_back(' ');
+        pendingSpace = false;
+        out.push_back(c);
+    }
+    return trimCopy(out);
+}
+
+static bool extractMaliAccessPathBeforeBracket(const std::string& source, size_t bracketPos,
+                                                size_t* pathStartOut, std::string* pathOut) {
+    if (bracketPos == 0) return false;
+    size_t p = bracketPos;
+    while (p > 0 && std::isspace(static_cast<unsigned char>(source[p - 1]))) --p;
+    const size_t pathEnd = p;
+    if (p == 0 || !isMaliIdentChar(source[p - 1])) return false;
+
+    // Parse IDENT(.IDENT)* backwards, allowing whitespace around dots.
+    while (true) {
+        while (p > 0 && isMaliIdentChar(source[p - 1])) --p;
+        if (p == 0) break;
+        size_t q = p;
+        while (q > 0 && std::isspace(static_cast<unsigned char>(source[q - 1]))) --q;
+        if (q == 0 || source[q - 1] != '.') break;
+        q--;
+        while (q > 0 && std::isspace(static_cast<unsigned char>(source[q - 1]))) --q;
+        if (q == 0 || !isMaliIdentChar(source[q - 1])) break;
+        p = q;
+    }
+
+    std::string path = normalizeMaliAccessPath(source.substr(p, pathEnd - p));
+    if (path.empty()) return false;
+    // Reject anything that is not IDENT(.IDENT)*.
+    bool wantStart = true;
+    for (size_t i = 0; i < path.size();) {
+        if (wantStart) {
+            if (!isMaliIdentStart(path[i])) return false;
+            ++i;
+            while (i < path.size() && isMaliIdentChar(path[i])) ++i;
+            wantStart = false;
+        }
+        if (i == path.size()) break;
+        if (path[i] != '.') return false;
+        ++i;
+        wantStart = true;
+    }
+    if (wantStart) return false;
+
+    if (pathStartOut) *pathStartOut = p;
+    if (pathOut) *pathOut = path;
+    return true;
+}
+
+static size_t findMatchingMaliBracket(const std::string& source, size_t openPos) {
+    if (openPos >= source.size() || source[openPos] != '[') return std::string::npos;
+    int depth = 1;
+    for (size_t i = openPos + 1; i < source.size(); ++i) {
+        if (source[i] == '[') ++depth;
+        else if (source[i] == ']' && --depth == 0) return i;
+    }
+    return std::string::npos;
+}
+
+struct MaliDynamicArrayWrite {
+    size_t start = 0;
+    size_t end = 0;
+    std::string path;
+    std::string index;
+    std::string suffix;
+    std::string op;
+    std::string rhs;
+};
+
+static std::vector<MaliDynamicArrayWrite> findMaliDynamicArrayWrites(const std::string& source) {
+    std::vector<MaliDynamicArrayWrite> writes;
+    size_t search = 0;
+    while (true) {
+        const size_t bracket = source.find('[', search);
+        if (bracket == std::string::npos) break;
+        search = bracket + 1;
+
+        size_t pathStart = 0;
+        std::string path;
+        if (!extractMaliAccessPathBeforeBracket(source, bracket, &pathStart, &path)) continue;
+
+        const size_t close = findMatchingMaliBracket(source, bracket);
+        if (close == std::string::npos) continue;
+        const std::string index = trimCopy(source.substr(bracket + 1, close - bracket - 1));
+        if (index.empty() || isMaliCompileTimeConstantIndex(source, index)) continue;
+
+        size_t p = close + 1;
+        std::string suffix;
+        while (true) {
+            while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+            if (p >= source.size() || source[p] != '.') break;
+            const size_t suffixStart = p++;
+            while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+            if (p >= source.size() || !isMaliIdentStart(source[p])) { p = suffixStart; break; }
+            ++p;
+            while (p < source.size() && isMaliIdentChar(source[p])) ++p;
+            suffix += normalizeMaliAccessPath(source.substr(suffixStart, p - suffixStart));
+        }
+
+        while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+        std::string op;
+        if (p + 1 < source.size() &&
+            ((source[p] == '+' || source[p] == '-' || source[p] == '*' || source[p] == '/') && source[p + 1] == '=')) {
+            op = source.substr(p, 2);
+            p += 2;
+        } else if (p < source.size() && source[p] == '=' && (p + 1 >= source.size() || source[p + 1] != '=')) {
+            op = "=";
+            ++p;
+        } else {
+            continue;
+        }
+
+        while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+        const size_t rhsStart = p;
+        int paren = 0, square = 0, brace = 0;
+        size_t semicolon = std::string::npos;
+        for (; p < source.size(); ++p) {
+            const char c = source[p];
+            if (c == '(') ++paren;
+            else if (c == ')' && paren > 0) --paren;
+            else if (c == '[') ++square;
+            else if (c == ']' && square > 0) --square;
+            else if (c == '{') ++brace;
+            else if (c == '}' && brace > 0) --brace;
+            else if (c == ';' && paren == 0 && square == 0 && brace == 0) {
+                semicolon = p;
+                break;
+            }
+        }
+        if (semicolon == std::string::npos) continue;
+
+        writes.push_back({pathStart, semicolon + 1, path, index, suffix, op,
+                          trimCopy(source.substr(rhsStart, semicolon - rhsStart))});
+        search = semicolon + 1;
+    }
+    return writes;
+}
+
+static std::string finalMaliIdentifier(const std::string& path) {
+    const size_t dot = path.find_last_of('.');
+    return dot == std::string::npos ? path : path.substr(dot + 1);
+}
+
+static unsigned int findMaliArrayExtentForIdentifier(const std::string& essl, const std::string& identifier) {
+    if (identifier.empty()) return 0;
+    unsigned int extent = 0;
+    size_t pos = 0;
+    while ((pos = essl.find(identifier, pos)) != std::string::npos) {
+        const bool leftOk = pos == 0 || !isMaliIdentChar(essl[pos - 1]);
+        const bool rightOk = isIdentifierBoundary(essl, pos + identifier.size());
+        if (!leftOk || !rightOk) {
+            pos += identifier.size();
+            continue;
+        }
+        size_t p = pos + identifier.size();
+        while (p < essl.size() && std::isspace(static_cast<unsigned char>(essl[p]))) ++p;
+        if (p >= essl.size() || essl[p] != '[') {
+            pos += identifier.size();
+            continue;
+        }
+        const size_t close = findMatchingMaliBracket(essl, p);
+        if (close == std::string::npos) break;
+        const unsigned int resolved = resolveMaliOutputArrayExtent(essl, essl.substr(p + 1, close - p - 1));
+        if (resolved > extent) extent = resolved;
+        pos = close + 1;
+    }
+    return extent;
+}
+
+
+static bool containsMaliTokenInRange(const std::string& text, size_t begin, size_t end,
+                                     const std::string& token) {
+    if (begin >= end || token.empty()) return false;
+    size_t pos = begin;
+    while ((pos = text.find(token, pos)) != std::string::npos && pos < end) {
+        const bool leftOk = pos == begin || !isMaliIdentChar(text[pos - 1]);
+        const size_t after = pos + token.size();
+        const bool rightOk = after >= end || !isMaliIdentChar(text[after]);
+        if (leftOk && rightOk) return true;
+        pos = after;
+    }
+    return false;
+}
+
+static bool isMaliLikelyFragmentOutputArrayIdentifier(const std::string& essl,
+                                                       const std::string& identifier) {
+    if (identifier == "gl_FragData" || identifier == "gl_SecondaryFragDataEXT" ||
+        identifier == "gl_SecondaryFragData") {
+        return true;
+    }
+    if (identifier.empty()) return false;
+
+    size_t pos = 0;
+    while ((pos = essl.find(identifier, pos)) != std::string::npos) {
+        const bool leftOk = pos == 0 || !isMaliIdentChar(essl[pos - 1]);
+        const bool rightOk = isIdentifierBoundary(essl, pos + identifier.size());
+        if (!leftOk || !rightOk) {
+            pos += identifier.size();
+            continue;
+        }
+
+        size_t p = pos + identifier.size();
+        while (p < essl.size() && std::isspace(static_cast<unsigned char>(essl[p]))) ++p;
+        if (p >= essl.size() || essl[p] != '[') {
+            pos += identifier.size();
+            continue;
+        }
+        const size_t close = findMatchingMaliBracket(essl, p);
+        if (close == std::string::npos ||
+            resolveMaliOutputArrayExtent(essl, essl.substr(p + 1, close - p - 1)) == 0) {
+            pos += identifier.size();
+            continue;
+        }
+
+        // Direct fragment output declaration, e.g.
+        //   layout(location = 0) out highp vec4 FragColor[8];
+        const size_t lineStartPos = essl.rfind('\n', pos);
+        const size_t lineStart = lineStartPos == std::string::npos ? 0 : lineStartPos + 1;
+        if (containsMaliTokenInRange(essl, lineStart, pos, "out")) return true;
+
+        // SPIRV-Cross can also emit an output interface block.  A member line
+        // then has no `out` token itself, so inspect the still-open block header:
+        //   out SomeBlock { vec4 color[8]; } outputs;
+        const size_t openBrace = essl.rfind('{', pos);
+        const size_t closeBrace = essl.rfind('}', pos);
+        if (openBrace != std::string::npos &&
+            (closeBrace == std::string::npos || openBrace > closeBrace)) {
+            size_t headerStart = essl.rfind(';', openBrace);
+            const size_t headerLine = essl.rfind('\n', openBrace);
+            if (headerStart == std::string::npos ||
+                (headerLine != std::string::npos && headerLine > headerStart)) {
+                headerStart = headerLine;
+            }
+            headerStart = headerStart == std::string::npos ? 0 : headerStart + 1;
+            if (containsMaliTokenInRange(essl, headerStart, openBrace, "out")) return true;
+        }
+
+        pos = close + 1;
+    }
+    return false;
+}
+
+struct MaliDynamicArrayAccess {
+    size_t start = 0;
+    size_t end = 0;
+    std::string path;
+    std::string index;
+    unsigned int extent = 0;
+};
+
+static std::vector<MaliDynamicArrayAccess> findMaliDynamicOutputArrayReads(const std::string& source,
+                                                                           size_t* remainingLvaluesOut = nullptr) {
+    if (remainingLvaluesOut) *remainingLvaluesOut = 0;
+    std::vector<MaliDynamicArrayAccess> reads;
+    size_t search = 0;
+    while (true) {
+        const size_t bracket = source.find('[', search);
+        if (bracket == std::string::npos) break;
+        search = bracket + 1;
+
+        size_t pathStart = 0;
+        std::string path;
+        if (!extractMaliAccessPathBeforeBracket(source, bracket, &pathStart, &path)) continue;
+        const size_t close = findMatchingMaliBracket(source, bracket);
+        if (close == std::string::npos) continue;
+
+        const std::string index = trimCopy(source.substr(bracket + 1, close - bracket - 1));
+        if (index.empty()) continue;
+        if (isMaliOutputArrayDeclarator(source, pathStart, close, index)) continue;
+        if (isMaliCompileTimeConstantIndex(source, index)) continue;
+
+        const std::string identifier = finalMaliIdentifier(path);
+        if (!isMaliLikelyFragmentOutputArrayIdentifier(source, identifier)) continue;
+        const unsigned int extent = findMaliArrayExtentForIdentifier(source, identifier);
+        if (extent == 0 || extent > 32) continue;
+
+        // If this access is still the left side of a direct assignment, leave it
+        // for the store pass.  V4 already handles these; counting it here makes
+        // any unhandled write obvious in the log rather than turning a ternary
+        // into an invalid lvalue.
+        size_t p = close + 1;
+        while (true) {
+            while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+            if (p >= source.size() || source[p] != '.') break;
+            ++p;
+            while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+            if (p >= source.size() || !isMaliIdentStart(source[p])) break;
+            ++p;
+            while (p < source.size() && isMaliIdentChar(source[p])) ++p;
+        }
+        while (p < source.size() && std::isspace(static_cast<unsigned char>(source[p]))) ++p;
+        const bool directAssignment =
+            (p < source.size() && source[p] == '=' && (p + 1 >= source.size() || source[p + 1] != '=')) ||
+            (p + 1 < source.size() &&
+             (source[p] == '+' || source[p] == '-' || source[p] == '*' || source[p] == '/') &&
+             source[p + 1] == '=');
+        if (directAssignment) {
+            if (remainingLvaluesOut) ++(*remainingLvaluesOut);
+            continue;
+        }
+
+        reads.push_back({pathStart, close + 1, path, index, extent});
+        search = close + 1;
+    }
+    return reads;
+}
+
+static std::string applyMaliFragmentOutputArrayReadWorkaround(const std::string& essl,
+                                                               size_t* rewritesOut = nullptr,
+                                                               size_t* remainingLvaluesOut = nullptr) {
+    if (rewritesOut) *rewritesOut = 0;
+    if (remainingLvaluesOut) *remainingLvaluesOut = 0;
+
+    const auto reads = findMaliDynamicOutputArrayReads(essl, remainingLvaluesOut);
+    if (reads.empty()) return essl;
+
+    // Replace from the end so source positions remain valid.  Every branch uses
+    // a literal index, satisfying Mali's fragment-output restriction without
+    // changing the output declaration/location semantics.
+    std::string patched = essl;
+    size_t count = 0;
+    for (auto it = reads.rbegin(); it != reads.rend(); ++it) {
+        const auto& access = *it;
+        std::string replacement = "(";
+        const std::string idxExpr = "int(" + access.index + ")";
+        for (unsigned int i = 0; i < access.extent; ++i) {
+            replacement += "(" + idxExpr + " == " + std::to_string(i) + ") ? " +
+                           access.path + "[" + std::to_string(i) + "] : ";
+        }
+        // Out-of-range fragment-output indexing is undefined anyway.  Use the
+        // first element only as a syntactically valid terminal expression.
+        replacement += access.path + "[0])";
+        patched.replace(access.start, access.end - access.start, replacement);
+        ++count;
+    }
+
+    if (rewritesOut) *rewritesOut = count;
+    if (count > 0) {
+        LOG_W_FORCE("[Shader] Mali fragment output-array workaround rewrote %zu dynamic read(s).", count)
+    }
+    return patched;
+}
+
+static std::string applyMaliFragmentOutputArrayWorkaround(const std::string& essl,
+                                                           GLenum shaderType,
+                                                           size_t* rewritesOut = nullptr) {
+    if (rewritesOut) *rewritesOut = 0;
+    if (shaderType != GL_FRAGMENT_SHADER || !isMaliRendererForOutputArrayWorkaround()) return essl;
+
+    try {
+        const auto writes = findMaliDynamicArrayWrites(essl);
+        if (writes.empty()) return essl;
+
+        std::string patched;
+        patched.reserve(essl.size() + writes.size() * 256);
+        size_t cursor = 0;
+        unsigned int serial = 0;
+        size_t rewriteCount = 0;
+        size_t candidateCount = 0;
+
+        for (const auto& write : writes) {
+            if (write.start < cursor) continue;
+            const unsigned int extent = findMaliArrayExtentForIdentifier(essl, finalMaliIdentifier(write.path));
+            if (extent == 0 || extent > 32) continue;
+            ++candidateCount;
+
+            patched.append(essl, cursor, write.start - cursor);
+            const std::string temp = "_mg_mali_out_idx_" + std::to_string(serial++);
+            patched += "{ int " + temp + " = int(" + write.index + "); ";
+            for (unsigned int i = 0; i < extent; ++i) {
+                patched += (i == 0 ? "if (" : " else if (");
+                patched += temp + " == " + std::to_string(i) + ") " + write.path + "[" +
+                           std::to_string(i) + "]" + write.suffix + " " + write.op + " " + write.rhs + ";";
+            }
+            patched += " }";
+            cursor = write.end;
+            ++rewriteCount;
+        }
+
+        if (rewriteCount == 0) return essl;
+        patched.append(essl, cursor, std::string::npos);
+        if (rewritesOut) *rewritesOut = rewriteCount;
+        LOG_W_FORCE("[Shader] Mali dynamic-array fallback found %zu candidate array(s).", candidateCount)
+        LOG_W_FORCE("[Shader] Mali fragment output-array workaround rewrote %zu dynamic store(s).", rewriteCount)
+        return patched;
+    } catch (const std::exception& error) {
+        // Never allow a compatibility rewrite to take the renderer process down.
+        LOG_E("[Shader] Mali output-array workaround skipped after parser exception: %s", error.what())
+        return essl;
+    } catch (...) {
+        LOG_E("[Shader] Mali output-array workaround skipped after unknown parser exception")
+        return essl;
+    }
+}
+
+// Compatibility fallback for desktop GLSL 1.50.
+//
+// The normal MobileGlues path is still GLSL -> glslang/SPIR-V -> SPIRV-Cross
+// -> ESSL.  Some Minecraft post-processing shaders (notably The Broken Script
+// 2.0.3) are valid desktop GLSL 1.50 but can be rejected by that path.  The old
+// failure behaviour returned the original "#version 150" source to ANGLE,
+// which is an ES compiler.  ANGLE then reports:
+//   '150' : client/version number not supported
+// and the post chain can render the world black.
+//
+// Only use this source-level ESSL 3.00 fallback after the normal converter has
+// failed, and only for GLSL 1.50.  This keeps existing shader-pack behaviour
+// untouched.
+static std::string glsl150CompatFallback(const char* glslCode, GLenum glslType, uint esslVersion) {
+    if (glslCode == nullptr) return "";
+
+    std::string result(glslCode);
+
+    static const std::regex version150(
+        R"(#version\s+150(?:\s+(?:core|compatibility))?)",
+        std::regex::ECMAScript);
+
+    if (!std::regex_search(result, version150)) {
+        return "";
+    }
+
+    // Both stages attached to a GLES program must use the same ESSL version.
+    // Do not hard-code 300 here: the normal SPIRV-Cross path targets the
+    // device's active ESSL level (for example 320 on ES 3.2). A 300 fallback
+    // paired with a successfully converted 320 shader compiles separately but
+    // fails at link time with "shader version mismatch".
+    const std::string targetVersion =
+        "#version " + std::to_string(esslVersion) + " es";
+    result = std::regex_replace(
+        result,
+        version150,
+        targetVersion,
+        std::regex_constants::format_first_only);
+
+    // Match the cleanup already performed by the normal SPIRV-Cross path.
+    result = removeLayoutBinding(result);
+
+    // Common compatibility-profile texture intrinsics have generic ESSL 3.00
+    // equivalents.  Do not touch already-modern texture() calls.
+    result = std::regex_replace(result, std::regex(R"(\btexture2D\s*\()"), "texture(");
+    result = std::regex_replace(result, std::regex(R"(\btextureCube\s*\()"), "texture(");
+    result = std::regex_replace(result, std::regex(R"(\btexture2DLod\s*\()"), "textureLod(");
+    result = std::regex_replace(result, std::regex(R"(\btextureCubeLod\s*\()"), "textureLod(");
+
+    // ESSL fragment/vertex shaders require explicit precision.  Reuse the
+    // existing MobileGlues helper so we do not duplicate precision lines.
+    // Desktop drivers are more permissive than ESSL 3.00 about a few
+    // expressions used by Minecraft mods. Normalize the common forms seen in
+    // The Broken Script before handing the fallback source to ANGLE.
+
+    // bvec -> vec conversion used by the mod's 4D simplex noise helper.
+    result = std::regex_replace(
+        result,
+        std::regex(R"(vec4\s*\(\s*lessThan\s*\(\s*p\s*,\s*vec4\s*\(\s*0\.0\s*\)\s*\)\s*\))"),
+        "mix(vec4(0.0), vec4(1.0), lessThan(p, vec4(0.0)))");
+
+    // textureSize() returns ivecN. ESSL requires an explicit conversion before
+    // multiplying it by a floating scalar.
+    result = std::regex_replace(
+        result,
+        std::regex(R"(textureSize\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*0\s*\)\s*\*\s*([0-9]*\.[0-9]+))"),
+        "vec2(textureSize($1, 0)) * $2");
+
+    // Desktop GLSL accepts arithmetic such as:
+    //   vec2Value - 1
+    // while strict ESSL rejects the int scalar against a float vector.
+    // Broken Script's CalcEyeFromWindow() uses exactly this form.  Normalize
+    // integer scalar literals adjacent to vector-style expressions to floats.
+    result = std::regex_replace(
+        result,
+        std::regex(R"((\)\s*-\s*)1(\s*;))"),
+        "$1 1.0$2");
+    result = std::regex_replace(
+        result,
+        std::regex(R"((\]\s*-\s*)1(\s*;))"),
+        "$1 1.0$2");
+
+    result = forceSupporterOutput(result);
+
+    // Preserve existing MobileGlues output-location normalization.
+    result = processOutColorLocations(result);
+
+    // GLSL 1.50 core uses explicit fragment outputs, but compatibility shaders
+    // may still contain gl_FragColor.  ESSL 3.00 removed that built-in.
+    if (glslType == GL_FRAGMENT_SHADER &&
+        result.find("gl_FragColor") != std::string::npos) {
+        result = std::regex_replace(
+            result, std::regex(R"(\bgl_FragColor\b)"), "mg_FragColor");
+
+        const size_t firstNewline = result.find('\n');
+        const size_t insertPos =
+            (firstNewline == std::string::npos) ? 0 : firstNewline + 1;
+        result.insert(insertPos,
+                      "layout(location = 0) out highp vec4 mg_FragColor;\n");
+    }
+
+    return result;
+}
+
 std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_version, uint glsl_version,
-                         int& return_code) {
+                         int& return_code, std::string* mali_store_only_fallback) {
+    if (mali_store_only_fallback) mali_store_only_fallback->clear();
+    const bool maliOutputArrayWorkaround =
+        glsl_type == GL_FRAGMENT_SHADER && isMaliRendererForOutputArrayWorkaround();
+
     std::string sha256_string(glsl_code);
     sha256_string += "\n//" + std::to_string(MAJOR) + "." + std::to_string(MINOR) + "." + std::to_string(REVISION) +
-                     "|" + std::to_string(essl_version);
+                     "|" + std::to_string(essl_version) + "|compat-s9ubo-bs150-v7-version-match";
+    if (maliOutputArrayWorkaround) sha256_string += "|mali-frag-out-array-v7-decl-safe";
+    const std::string maliFallbackCacheKey = sha256_string + "|store-only-fallback";
     const char* cachedESSL = Cache::get_instance().get(sha256_string.c_str());
     if (cachedESSL) {
+        if (mali_store_only_fallback && maliOutputArrayWorkaround) {
+            const char* cachedFallback = Cache::get_instance().get(maliFallbackCacheKey.c_str());
+            if (cachedFallback) *mali_store_only_fallback = cachedFallback;
+        }
         LOG_D("GLSL Hit Cache:\n%s\n-->\n%s", glsl_code, cachedESSL)
         return_code = 0;
         return (char*)cachedESSL;
@@ -362,12 +1221,66 @@ std::string GLSLtoGLSLES(const char* glsl_code, GLenum glsl_type, uint essl_vers
     // std::string converted = glsl_version<140? GLSLtoGLSLES_1(glsl_code, glsl_type, essl_version,
     // return_code):GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
     std::string converted = GLSLtoGLSLES_2(glsl_code, glsl_type, essl_version, return_code);
-    if (return_code >= 0 && !converted.empty()) {
-        converted = process_uniform_declarations(converted);
-        Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
+
+    // Never pass a failed desktop GLSL 1.50 conversion straight through to an
+    // ES/ANGLE compiler.  Try the conservative ESSL 3.00 compatibility path.
+    if ((return_code < 0 || converted.empty()) && glsl_version == 150) {
+        LOG_W_FORCE("[Shader] GLSL 150 SPIR-V conversion failed; trying ESSL 300 compatibility fallback.")
+        converted = glsl150CompatFallback(glsl_code, glsl_type, essl_version);
+        if (!converted.empty()) {
+            return_code = 1;
+            LOG_W_FORCE("[Shader] GLSL 150 compatibility fallback generated ESSL %u source.", essl_version)
+        }
     }
 
-    return (return_code >= 0) ? converted : glsl_code;
+    if (return_code >= 0 && !converted.empty()) {
+        converted = process_uniform_declarations(converted);
+
+        // Snapshot 5+ compatibility. `_uniform` may be generated by
+        // SPIRV-Cross after the launcher has already had its chance to rename
+        // source identifiers. Rename the complete GLSL identifier here, in the
+        // translated ESSL, so declarations and all references remain consistent.
+        converted = std::regex_replace(
+            converted,
+            std::regex(R"(\b_uniform\b)"),
+            "_db_uvar");
+
+        std::string maliStoreOnlyFallback;
+        if (maliOutputArrayWorkaround) {
+            size_t storeRewrites = 0;
+            converted = applyMaliFragmentOutputArrayWorkaround(converted, glsl_type, &storeRewrites);
+
+            // Keep the store-only form before the newer dynamic-read rewrite.
+            // Some Mali compilers reject a ternary-expanded output-array read when
+            // the surrounding GLSL context still requires an lvalue (for example
+            // an out/inout argument). shader.cpp can retry this known-good form
+            // instead of lying about GL_COMPILE_STATUS and linking a broken program.
+            maliStoreOnlyFallback = converted;
+
+            size_t readRewrites = 0;
+            size_t remainingLvalues = 0;
+            converted = applyMaliFragmentOutputArrayReadWorkaround(
+                converted, &readRewrites, &remainingLvalues);
+            if (remainingLvalues > 0) {
+                LOG_E("[Shader] Mali fragment output-array workaround still has %zu dynamic lvalue access(es).",
+                      remainingLvalues)
+            }
+            if (readRewrites == 0) maliStoreOnlyFallback.clear();
+            if (mali_store_only_fallback && !maliStoreOnlyFallback.empty()) {
+                *mali_store_only_fallback = maliStoreOnlyFallback;
+            }
+        }
+
+        Cache::get_instance().put(sha256_string.c_str(), converted.c_str());
+        if (!maliStoreOnlyFallback.empty()) {
+            Cache::get_instance().put(maliFallbackCacheKey.c_str(), maliStoreOnlyFallback.c_str());
+        }
+        return converted;
+    }
+
+    // Preserve historical behaviour for other GLSL versions.  The known-bad
+    // GLSL 1.50 -> ANGLE pass-through is handled above.
+    return glsl_code;
 }
 
 std::string replace_line_starting_with(const std::string& glslCode, const std::string& starting,

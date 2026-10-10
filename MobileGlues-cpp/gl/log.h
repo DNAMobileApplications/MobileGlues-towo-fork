@@ -15,6 +15,13 @@
 
 #define LOG_CALLED_FUNCS 0
 
+// Temporary DroidBridge/DH 26.2 diagnostics are useful while tracing a renderer
+// bug, but they must stay off in normal builds. Several of those probes sit on
+// draw/VAO/buffer hot paths and force logcat + stdout + file I/O.
+#ifndef DROIDBRIDGE_GL_DIAGNOSTICS
+#define DROIDBRIDGE_GL_DIAGNOSTICS 0
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {

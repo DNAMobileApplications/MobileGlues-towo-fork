@@ -28,6 +28,7 @@ Version GLVersion;
 namespace {
 // See mg_set_gl_error in gl/mg.h for why this exists and why it is per thread.
 thread_local GLenum g_frontend_error = GL_NO_ERROR;
+std::vector<std::string> frontend_extensions;
 } // namespace
 
 void mg_set_gl_error(GLenum error) {
@@ -49,25 +50,14 @@ void glGetIntegerv(GLenum pname, GLint* params) {
     case GL_CONTEXT_PROFILE_MASK:
         (*params) = GL_CONTEXT_CORE_PROFILE_BIT;
         break;
+    case GL_CLIP_ORIGIN:
+        (*params) = static_cast<GLint>(mg_clip_origin);
+        break;
+    case GL_CLIP_DEPTH_MODE:
+        (*params) = static_cast<GLint>(mg_clip_depth_mode);
+        break;
     case GL_NUM_EXTENSIONS:
-        static GLint num_extensions = -1;
-        if (num_extensions == -1) {
-            const GLubyte* ext_str = glGetString(GL_EXTENSIONS);
-            if (ext_str) {
-                std::string copy_str((const char*)ext_str);
-                std::string token;
-                size_t pos = 0;
-                num_extensions = 0;
-                while ((pos = copy_str.find(' ')) != std::string::npos) {
-                    num_extensions++;
-                    copy_str.erase(0, pos + 1);
-                }
-                if (!copy_str.empty()) num_extensions++; // Count the last token
-            } else {
-                num_extensions = 0;
-            }
-        }
-        (*params) = num_extensions;
+        (*params) = static_cast<GLint>(frontend_extensions.size());
         break;
     case GL_MAJOR_VERSION:
         // What THIS context was granted, which after the version gate was relaxed
@@ -209,6 +199,13 @@ GLenum glGetError() {
 }
 
 static std::string es_ext;
+static void RebuildFrontendExtensionString() {
+    es_ext.clear();
+    for (const auto& ext : frontend_extensions) {
+        es_ext += ext;
+        es_ext += ' ';
+    }
+}
 std::string GetExtensionsList() {
     return es_ext;
 }
@@ -253,16 +250,17 @@ void InitGLESBaseExtensions() {
         }
     }
 
-    es_ext.clear();
-    for (const auto& ext : extensions) {
-        es_ext += ext;
-        es_ext += " ";
-    }
+    frontend_extensions = std::move(extensions);
+    RebuildFrontendExtensionString();
 }
 
 void AppendExtension(const char* ext) {
-    es_ext += ext;
-    es_ext += ' ';
+    if (ext == nullptr || ext[0] == '\0') return;
+    for (const auto& existing : frontend_extensions) {
+        if (existing == ext) return;
+    }
+    frontend_extensions.emplace_back(ext);
+    RebuildFrontendExtensionString();
 }
 
 std::string getBeforeThirdSpace(const std::string& str) {
@@ -484,17 +482,8 @@ const GLubyte* glGetString(GLenum name) {
 
         return reinterpret_cast<const GLubyte*>(shadingLangString.c_str());
     }
-    case GL_EXTENSIONS: {
-        // GetExtensionsList() returns by value, so assigning it on every call freed the buffer handed
-        // out last time and dangled every pointer already returned. Build it once, like the strings above.
-        static std::string extensionsString;
-
-        if (extensionsString.empty()) {
-            extensionsString = GetExtensionsList();
-        }
-
-        return (const GLubyte*)extensionsString.c_str();
-    }
+    case GL_EXTENSIONS:
+        return reinterpret_cast<const GLubyte*>(es_ext.c_str());
     case GL_SETTINGS_MG: {
         if (global_settings.hide_mg_env_level >= HideMGEnvLevel::Level1) return GLES.glGetString(name);
 
@@ -521,6 +510,11 @@ const GLubyte* glGetStringi(GLenum name, GLuint index) {
     LOG()
     if (name == GL_EXTENSIONS + GL_BACKEND_GETTER_MG && global_settings.hide_mg_env_level == HideMGEnvLevel::Disabled) {
         return GLES.glGetStringi(name - GL_BACKEND_GETTER_MG, index);
+    }
+
+    if (name == GL_EXTENSIONS) {
+        if (index >= frontend_extensions.size()) return nullptr;
+        return reinterpret_cast<const GLubyte*>(frontend_extensions[index].c_str());
     }
 
     typedef struct {

@@ -725,14 +725,7 @@ static bool prepare_indirect_buffer(const GLsizei* counts, GLenum type, const vo
     // thread_local for the same reason as mg_zero_basevertex: nothing in this
     // file takes a lock, and two threads can each have a current context.
     static thread_local std::vector<draw_elements_indirect_command_t> staged;
-    // Grown only, like basevertex_staging in drawing.cpp:294 and the rebased
-    // and zeros vectors below. A plain resize() to the exact length shrinks
-    // after a small draw and then value-initialises the difference on the next
-    // large one, a memset of the tail that the fill loop below overwrites
-    // anyway. Only the first primcount commands are read, by the loop and by
-    // the glBufferSubData length, so the size past them never matters.
-    if (staged.size() < static_cast<size_t>(primcount))
-        staged.resize(static_cast<size_t>(primcount));
+    staged.resize(static_cast<size_t>(primcount));
     draw_elements_indirect_command_t* pcmds = staged.data();
 
     for (GLsizei i = 0; i < primcount; ++i) {
@@ -1928,6 +1921,12 @@ void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GL
 
 void glMultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
     LOG()
+    static thread_local int dh_draw_log_arrays = 0;
+    if (dh_draw_log_arrays < 20) {
+        LOG_W_FORCE("[DH26.2 DRAW TEST] glMultiDrawArraysIndirect drawcount=%d stride=%d backend=indirect-loop",
+                    drawcount, stride)
+        ++dh_draw_log_arrays;
+    }
     if (drawcount <= 0) return;
     if (stride < 0) {
         MD_WARN_ONCE("glMultiDrawArraysIndirect: negative stride %d", stride);

@@ -11,6 +11,8 @@
 #include <memory>
 #include <ska/flat_hash_map.hpp>
 #include "log.h"
+#include "mg.h"
+#include <cstring>
 #include "../config/settings.h"
 #include "FSR1/FSR1.h"
 
@@ -365,6 +367,39 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint
                        GLint dstY1, GLbitfield mask, GLenum filter) {
     LOG()
     mg_fsr_read_scope_t fsr_read;
+
+    // On Adreno, pending tile-buffer depth writes may not yet be visible to
+    // a subsequent depth copy.  The same protection already exists in the
+    // glCopyTexSubImage2D depth fallback in gl/texture.cpp, but regular FBO
+    // depth blits did not have it.  Never affect pre-26.2 Minecraft or Mali.
+    // This is a deliberately small, reversible Adreno experiment.
+    if ((mask & GL_DEPTH_BUFFER_BIT) != 0 && mg_modern_depth_compat_enabled()) {
+        static thread_local int z9_is_adreno = -1;
+        if (z9_is_adreno < 0) {
+            z9_is_adreno = 0;
+            if (GLES.glGetString != nullptr) {
+                const GLubyte* renderer = GLES.glGetString(GL_RENDERER);
+                if (renderer != nullptr &&
+                    std::strstr(reinterpret_cast<const char*>(renderer), "Adreno") != nullptr) {
+                    z9_is_adreno = 1;
+                }
+            }
+        }
+        if (z9_is_adreno == 1) {
+            static thread_local unsigned int z9_depth_blits = 0;
+            ++z9_depth_blits;
+            GLint src_fbo = 0, dst_fbo = 0;
+            if (z9_depth_blits <= 16 || (z9_depth_blits <= 3200 && (z9_depth_blits % 200 == 0))) {
+                GLES.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &src_fbo);
+                GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &dst_fbo);
+                LOG_W_FORCE("[MG-DH-Z9] Adreno depth blit #%u srcFbo=%d dstFbo=%d mask=0x%x filter=0x%x rect=%d,%d-%d,%d -> %d,%d-%d,%d flush=%d",
+                            z9_depth_blits, src_fbo, dst_fbo, mask, filter,
+                            srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1,
+                            GLES.glFlush != nullptr ? 1 : 0)
+            }
+            if (GLES.glFlush != nullptr) GLES.glFlush();
+        }
+    }
     GLES.glBlitFramebuffer(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
     CHECK_GL_ERROR
 }

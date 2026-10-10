@@ -6,6 +6,10 @@
 // End of Source File Header
 
 #include "drawing.h"
+#include "enable.h"
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include "restart.h"
 #include "buffer.h"
 #include "framebuffer.h"
@@ -193,14 +197,249 @@ void setupBufferTextureUniforms(GLuint program) {
     GLES.glUniform1i(info.locHeight, texObject->height);
 }
 
+
+namespace {
+
+// Flashback/Dear ImGui uses a small RGBA font/UI atlas.  MobileGlues 1.3.5
+// rendered it correctly while the 2.x pipeline can end up sampling the same
+// underlying RGBA image as black/opaque.  An FBO readback of the texture does
+// not apply texture swizzle, so a bad driver-side swizzle is invisible to the
+// readback diagnostics even though it changes texture() in the fragment shader.
+//
+// Query the *real GLES object* immediately before the ImGui draw.  The frontend
+// TextureObject shadow is intentionally not consulted here: glTexImage2D resets
+// that shadow to RGBA identity, so it can say identity even when a previous
+// driver-side parameter call left the real object on another swizzle.
+struct imgui_sampling_cache_t {
+    GLuint program = 0;
+    GLint proj = -1;
+    GLint texture = -1;
+    bool imgui = false;
+};
+
+thread_local imgui_sampling_cache_t g_imgui_sampling_cache;
+
+const imgui_sampling_cache_t& resolve_imgui_sampling(GLuint program) {
+    if (g_imgui_sampling_cache.program == program) return g_imgui_sampling_cache;
+
+    g_imgui_sampling_cache = {};
+    g_imgui_sampling_cache.program = program;
+    if (program == 0) return g_imgui_sampling_cache;
+
+    g_imgui_sampling_cache.proj = GLES.glGetUniformLocation(program, "ProjMtx");
+    g_imgui_sampling_cache.texture = GLES.glGetUniformLocation(program, "Texture");
+    g_imgui_sampling_cache.imgui = g_imgui_sampling_cache.proj >= 0 && g_imgui_sampling_cache.texture >= 0;
+    return g_imgui_sampling_cache;
+}
+
+struct imgui_sampler_guard_t {
+    GLint unit = -1;
+    GLint previous = 0;
+
+    explicit imgui_sampler_guard_t(GLuint program) {
+        if (!GLES.glBindSampler || !GLES.glGetUniformiv || !GLES.glGetIntegerv) return;
+        const auto& info = resolve_imgui_sampling(program);
+        if (!info.imgui) return;
+
+        GLint requested_unit = -1;
+        GLES.glGetUniformiv(program, info.texture, &requested_unit);
+        if (requested_unit < 0 || requested_unit >= 32) return;
+
+        GLint old_active = GL_TEXTURE0;
+        GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &old_active);
+        GLES.glActiveTexture(GL_TEXTURE0 + requested_unit);
+        GLint bound_texture = 0;
+        GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_texture);
+        GLES.glGetIntegerv(GL_SAMPLER_BINDING, &previous);
+        GLES.glActiveTexture(static_cast<GLenum>(old_active));
+        if (bound_texture == 0 || previous == 0) return;
+
+        unit = requested_unit;
+        static thread_local int reports = 0;
+        if (reports++ < 8) {
+            GLint min_filter = -1, mag_filter = -1, wrap_s = -1, compare_mode = -1;
+            if (GLES.glGetSamplerParameteriv) {
+                GLES.glGetSamplerParameteriv(static_cast<GLuint>(previous), GL_TEXTURE_MIN_FILTER, &min_filter);
+                GLES.glGetSamplerParameteriv(static_cast<GLuint>(previous), GL_TEXTURE_MAG_FILTER, &mag_filter);
+                GLES.glGetSamplerParameteriv(static_cast<GLuint>(previous), GL_TEXTURE_WRAP_S, &wrap_s);
+                GLES.glGetSamplerParameteriv(static_cast<GLuint>(previous), GL_TEXTURE_COMPARE_MODE, &compare_mode);
+            }
+            LOG_W_FORCE("[MG-IMGUI-SAMPLER] program=%u unit=%d texture=%d previousSampler=%d min=0x%x mag=0x%x wrapS=0x%x compare=0x%x; temporarily unbinding",
+                        program, unit, bound_texture, previous, min_filter, mag_filter, wrap_s, compare_mode)
+        }
+        GLES.glBindSampler(static_cast<GLuint>(unit), 0);
+    }
+
+    ~imgui_sampler_guard_t() {
+        if (unit >= 0) GLES.glBindSampler(static_cast<GLuint>(unit), static_cast<GLuint>(previous));
+    }
+    imgui_sampler_guard_t(const imgui_sampler_guard_t&) = delete;
+    imgui_sampler_guard_t& operator=(const imgui_sampler_guard_t&) = delete;
+};
+
+void restore_imgui_atlas_driver_swizzle(GLuint program) {
+    const imgui_sampling_cache_t& info = resolve_imgui_sampling(program);
+    if (!info.imgui || GLES.glGetTexParameteriv == nullptr || GLES.glTexParameteri == nullptr) return;
+
+    GLint unit = 0;
+    GLES.glGetUniformiv(program, info.texture, &unit);
+    if (unit < 0 || unit >= 32) return;
+
+    GLint saved_active = GL_TEXTURE0;
+    GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &saved_active);
+    GLES.glActiveTexture(GL_TEXTURE0 + unit);
+
+    GLint texture = 0;
+    GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    if (texture == 0) {
+        GLES.glActiveTexture(static_cast<GLenum>(saved_active));
+        return;
+    }
+
+    GLint width = 0;
+    GLint height = 0;
+    GLint internal = 0;
+    if (GLES.glGetTexLevelParameteriv != nullptr) {
+        GLES.glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+        GLES.glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+#ifdef GL_TEXTURE_INTERNAL_FORMAT
+        GLES.glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &internal);
+#endif
+    }
+
+    GLint swizzle_r = GL_RED;
+    GLint swizzle_g = GL_GREEN;
+    GLint swizzle_b = GL_BLUE;
+    GLint swizzle_a = GL_ALPHA;
+    GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, &swizzle_r);
+    GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, &swizzle_g);
+    GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, &swizzle_b);
+    GLES.glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, &swizzle_a);
+
+    // This is the Flashback font/UI atlas observed on both the 1.21.9-1.21.11
+    // and 26.1.x paths.  Keep the workaround tightly scoped so an ImGui image
+    // widget with an intentional custom swizzle is not changed.
+    const bool looks_like_flashback_atlas = width == 512 && height == 256 &&
+        (internal == GL_RGBA || internal == GL_RGBA8 || internal == 0);
+    const bool identity = swizzle_r == GL_RED && swizzle_g == GL_GREEN &&
+                          swizzle_b == GL_BLUE && swizzle_a == GL_ALPHA;
+
+    bool repaired = false;
+    if (looks_like_flashback_atlas && !identity) {
+        GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+        GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
+        GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
+        GLES.glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
+        repaired = true;
+    }
+
+    static thread_local GLuint last_texture = 0;
+    static thread_local GLint last_r = -1, last_g = -1, last_b = -1, last_a = -1;
+    static thread_local int logs = 0;
+    if (logs < 24 && (texture != static_cast<GLint>(last_texture) ||
+                      swizzle_r != last_r || swizzle_g != last_g ||
+                      swizzle_b != last_b || swizzle_a != last_a || repaired)) {
+        LOG_W_FORCE("[MobileGlues][ImGui REAL swizzle] program=%u unit=%d tex=%d size=%dx%d internal=0x%x driver=%d/%d/%d/%d expected=%d/%d/%d/%d repaired=%d",
+                    program, unit, texture, width, height, internal,
+                    swizzle_r, swizzle_g, swizzle_b, swizzle_a,
+                    GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA, repaired ? 1 : 0)
+        ++logs;
+        last_texture = static_cast<GLuint>(texture);
+        last_r = swizzle_r;
+        last_g = swizzle_g;
+        last_b = swizzle_b;
+        last_a = swizzle_a;
+    }
+
+    GLES.glActiveTexture(static_cast<GLenum>(saved_active));
+}
+
+} // namespace
+
+// Lightweight ImGui-only probe, automatically active for the first four draws.
+// Set MG_IMGUI_GL_PROBE=0 before launch to disable. Driver and frontend state
+// are queried separately; the probe does not change rendering state.
+static void mg_imgui_probe_draw_state(GLuint program) {
+    const auto& info = resolve_imgui_sampling(program);
+    if (!info.imgui) return;
+
+    const char* probe = std::getenv("MG_IMGUI_GL_PROBE");
+    const bool trace = probe == nullptr || std::strcmp(probe, "0") != 0;
+    const char* force = std::getenv("MG_IMGUI_FORCE_BLEND");
+    const bool force_blend = force != nullptr && std::strcmp(force, "1") == 0;
+    if (!trace && !force_blend) return;
+
+    if (trace) {
+        static thread_local int seen = 0;
+        if (seen++ < 4) {
+            GLint fbo = 0, active_tex = 0, bound_tex = 0, bound_sampler = 0;
+            GLint vao = 0, ebo = 0, pbo = 0;
+            GLint src_rgb = 0, dst_rgb = 0, src_a = 0, dst_a = 0;
+            GLint eq_rgb = 0, eq_a = 0;
+            GLboolean color_mask[4] = {0,0,0,0};
+            const GLint color_attrib = GLES.glGetAttribLocation(program, "Color");
+            GLint color_type = 0, color_norm = 0, color_size = 0, color_stride = 0, color_vbo = 0;
+            if (color_attrib >= 0 && GLES.glGetVertexAttribiv != nullptr) {
+                GLES.glGetVertexAttribiv(static_cast<GLuint>(color_attrib), GL_VERTEX_ATTRIB_ARRAY_TYPE, &color_type);
+                GLES.glGetVertexAttribiv(static_cast<GLuint>(color_attrib), GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &color_norm);
+                GLES.glGetVertexAttribiv(static_cast<GLuint>(color_attrib), GL_VERTEX_ATTRIB_ARRAY_SIZE, &color_size);
+                GLES.glGetVertexAttribiv(static_cast<GLuint>(color_attrib), GL_VERTEX_ATTRIB_ARRAY_STRIDE, &color_stride);
+                GLES.glGetVertexAttribiv(static_cast<GLuint>(color_attrib), GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &color_vbo);
+            }
+            GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+            GLES.glGetIntegerv(GL_ACTIVE_TEXTURE, &active_tex);
+            GLES.glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_tex);
+            GLES.glGetIntegerv(GL_SAMPLER_BINDING, &bound_sampler);
+            GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+            GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+            GLES.glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
+            GLES.glGetIntegerv(GL_BLEND_SRC_RGB, &src_rgb);
+            GLES.glGetIntegerv(GL_BLEND_DST_RGB, &dst_rgb);
+            GLES.glGetIntegerv(GL_BLEND_SRC_ALPHA, &src_a);
+            GLES.glGetIntegerv(GL_BLEND_DST_ALPHA, &dst_a);
+            GLES.glGetIntegerv(GL_BLEND_EQUATION_RGB, &eq_rgb);
+            GLES.glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &eq_a);
+            GLES.glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+            LOG_W_FORCE("[MG-IMGUI-PROBE] program=%u fbo=%d activeTex=%d texture=%d sampler=%d vao=%d ebo=%d unpackPBO=%d",
+                        program, fbo, active_tex-GL_TEXTURE0, bound_tex, bound_sampler, vao, ebo, pbo)
+            LOG_W_FORCE("[MG-IMGUI-PROBE] blend(driver/frontend)=%d/%d depth=%d scissor=%d srcRGB=%d dstRGB=%d srcA=%d dstA=%d eqRGB=%d eqA=%d rgbaMask=%d%d%d%d",
+                        GLES.glIsEnabled(GL_BLEND) ? 1 : 0, mg_enable_get(GL_BLEND,0) ? 1 : 0,
+                        GLES.glIsEnabled(GL_DEPTH_TEST) ? 1 : 0, GLES.glIsEnabled(GL_SCISSOR_TEST) ? 1 : 0,
+                        src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a,
+                        color_mask[0],color_mask[1],color_mask[2],color_mask[3])
+            LOG_W_FORCE("[MG-IMGUI-PROBE] colorAttrib=%d type=0x%x normalized=%d size=%d stride=%d vbo=%d (expected normalized=1 for packed UBYTE color)",
+                        color_attrib, color_type, color_norm, color_size, color_stride, color_vbo)
+        }
+    }
+
+    if (force_blend) {
+        // Diagnostic only. ImGui's Java renderer already requests precisely this
+        // state; forcing it through GLES tests whether MG suppressed that request.
+        GLES.glEnable(GL_BLEND);
+        GLES.glBlendEquation(GL_FUNC_ADD);
+        GLES.glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    }
+}
+
 void prepareForDraw() {
     LOG_D("prepareForDraw...")
     if (hardware->emulate_texture_buffer) {
         setupBufferTextureUniforms(gl_state->current_program);
     }
+    restore_imgui_atlas_driver_swizzle(gl_state->current_program);
+    mg_imgui_probe_draw_state(gl_state->current_program);
 }
 
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount) {
+
+    static thread_local int dh262_dei = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_dei++ < 80) {
+        GLint vao = 0, ebo = 0;
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+        LOG_W_FORCE("[DH26.2 DRAW] glDrawElementsInstanced mode=0x%x count=%d type=0x%x indices=%p instances=%d vao=%d ebo=%d",
+                    mode, count, type, indices, primcount, vao, ebo)
+    }
     LOG()
     LOG_D("glDrawElementsInstanced, mode: %d, count: %d, type: %d, indices: %p, primcount: %d", mode, count, type,
           indices, primcount)
@@ -214,9 +453,19 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void
 }
 
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+
+    static thread_local int dh262_de = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_de++ < 80) {
+        GLint vao = 0, ebo = 0;
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+        LOG_W_FORCE("[DH26.2 DRAW] glDrawElements mode=0x%x count=%d type=0x%x indices=%p vao=%d ebo=%d",
+                    mode, count, type, indices, vao, ebo)
+    }
     LOG()
     LOG_D("glDrawElements, mode: %d, count: %d, type: %d, indices: %p", mode, count, type, indices)
     prepareForDraw();
+    imgui_sampler_guard_t imgui_sampler_guard(gl_state->current_program);
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, 0, -1)) return;
     const bool restart_fixed = mg_restart_needs_driver_fixed(type);
     if (restart_fixed) GLES.glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
@@ -298,10 +547,20 @@ void* basevertex_staging(size_t bytes) {
 } // namespace
 
 void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint basevertex) {
+
+    static thread_local int dh262_debv = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_debv++ < 80) {
+        GLint vao = 0, ebo = 0;
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+        LOG_W_FORCE("[DH26.2 DRAW] glDrawElementsBaseVertex mode=0x%x count=%d type=0x%x indices=%p base=%d vao=%d ebo=%d",
+                    mode, count, type, indices, basevertex, vao, ebo)
+    }
     LOG()
     LOG_D("glDrawElementsBaseVertex, mode: %d, count: %d, type: %d, indices: %p, basevertex: %d", mode, count, type,
           indices, basevertex);
     prepareForDraw();
+    imgui_sampler_guard_t imgui_sampler_guard(gl_state->current_program);
     // The rewrite applies the base vertex itself, so it covers both the emulated
     // and the driver-supported branch below.
     if (mg_restart_needs_rewrite(type) && mg_draw_elements_restart(mode, count, type, indices, basevertex, -1)) return;
@@ -479,18 +738,496 @@ void glDrawRangeElementsBaseVertex(GLenum mode, GLuint start, GLuint end, GLsize
     CHECK_GL_ERROR
 }
 
+
+namespace {
+
+bool dh262_is_lod_packed_signature() {
+    GLint en0 = 0, size0 = 0, type0 = 0, int0 = 0;
+    GLint en5 = 0, size5 = 0, type5 = 0, int5 = 0;
+    GLES.glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en0);
+    GLES.glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size0);
+    GLES.glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type0);
+#ifdef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+    GLES.glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &int0);
+#endif
+    GLES.glGetVertexAttribiv(5, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en5);
+    GLES.glGetVertexAttribiv(5, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size5);
+    GLES.glGetVertexAttribiv(5, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type5);
+#ifdef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+    GLES.glGetVertexAttribiv(5, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &int5);
+#endif
+    return en0 && int0 && size0 == 3 && type0 == GL_UNSIGNED_SHORT &&
+           en5 && int5 && size5 == 1 && type5 == GL_UNSIGNED_SHORT;
+}
+
+struct dh262_lod_depth_compat_guard_t {
+    bool changed = false;
+    GLint previous = GL_LESS;
+
+    explicit dh262_lod_depth_compat_guard_t(bool enable) {
+        if (!enable) return;
+        if (GLES.glIsEnabled(GL_DEPTH_TEST) != GL_TRUE) return;
+        GLES.glGetIntegerv(GL_DEPTH_FUNC, &previous);
+        if (previous == GL_GREATER) {
+            GLES.glDepthFunc(GL_ALWAYS);
+            changed = true;
+            static thread_local int dh262_depth_fix_log = 0;
+            if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_depth_fix_log++ < 64) {
+                LOG_W_FORCE("[DH26.2 DEPTH FIX] packed LOD draw: GL_GREATER -> GL_ALWAYS for this draw")
+            }
+        }
+    }
+
+    ~dh262_lod_depth_compat_guard_t() {
+        if (changed) GLES.glDepthFunc(static_cast<GLenum>(previous));
+    }
+
+    dh262_lod_depth_compat_guard_t(const dh262_lod_depth_compat_guard_t&) = delete;
+    dh262_lod_depth_compat_guard_t& operator=(const dh262_lod_depth_compat_guard_t&) = delete;
+};
+
+// Z11 isolates GPU face culling and captures the actual std140 projection data
+// sent to Adreno.  It never changes shaders, uniform buffers, depth or clip mode.
+// All temporary native buffer bindings are restored before the terrain draw.
+static bool dh_z11_on_adreno() {
+    if (!mg_modern_depth_compat_enabled()) return false;
+    static thread_local unsigned long long cached_ctx = ~0ull;
+    static thread_local bool is_adreno = false;
+    const unsigned long long ctx_id = g_current_ctx ? g_current_ctx->id : 0ull;
+    if (cached_ctx != ctx_id) {
+        const GLubyte* name = GLES.glGetString(GL_RENDERER);
+        is_adreno = name && std::strstr(reinterpret_cast<const char*>(name), "Adreno") != nullptr;
+        cached_ctx = ctx_id;
+    }
+    return is_adreno;
+}
+
+struct dh_z11_gpu_cull_guard_t {
+    bool changed = false;
+    explicit dh_z11_gpu_cull_guard_t(bool enabled) {
+        if (!enabled || GLES.glIsEnabled(GL_CULL_FACE) != GL_TRUE) return;
+        GLES.glDisable(GL_CULL_FACE);
+        changed = true;
+        static thread_local int times = 0;
+        if (times++ < 6) {
+            LOG_W_FORCE("[MG-DH-Z11-CULL] temporarily disabled Adreno GPU face culling for a DH terrain draw")
+        }
+    }
+    ~dh_z11_gpu_cull_guard_t() { if (changed) GLES.glEnable(GL_CULL_FACE); }
+    dh_z11_gpu_cull_guard_t(const dh_z11_gpu_cull_guard_t&) = delete;
+    dh_z11_gpu_cull_guard_t& operator=(const dh_z11_gpu_cull_guard_t&) = delete;
+};
+
+// Read through a temporary COPY buffer.  The Minecraft uniform store can be
+// immutable and not GL_MAP_READ_BIT capable, so mapping the original buffer is
+// invalid.  A copy to a new mutable staging buffer can be mapped for reading.
+static bool dh_z11_read_gpu_buffer(GLuint source, GLintptr offset, GLsizeiptr size, unsigned char* out) {
+    if (!source || !out || size <= 0 || size > 128 ||
+        !GLES.glCopyBufferSubData || !GLES.glMapBufferRange || !GLES.glUnmapBuffer ||
+        !GLES.glGenBuffers || !GLES.glDeleteBuffers) return false;
+    GLint saved_read = 0, saved_write = 0;
+    GLES.glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &saved_read);
+    GLES.glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &saved_write);
+    GLuint stage = 0;
+    GLES.glGenBuffers(1, &stage);
+    if (!stage) return false;
+    bool copied = false;
+    GLES.glBindBuffer(GL_COPY_READ_BUFFER, source);
+    GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, stage);
+    GLES.glBufferData(GL_COPY_WRITE_BUFFER, size, nullptr, GL_STREAM_READ);
+    GLES.glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, offset, 0, size);
+    void* mapped = GLES.glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, size, GL_MAP_READ_BIT);
+    if (mapped) {
+        std::memcpy(out, mapped, static_cast<size_t>(size));
+        GLES.glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+        copied = true;
+    }
+    GLES.glBindBuffer(GL_COPY_READ_BUFFER, static_cast<GLuint>(saved_read));
+    GLES.glBindBuffer(GL_COPY_WRITE_BUFFER, static_cast<GLuint>(saved_write));
+    GLES.glDeleteBuffers(1, &stage);
+    return copied;
+}
+
+static void dh_z11_probe_ubo(GLuint program) {
+    if (!mg_modern_depth_compat_enabled()) return;
+    static thread_local unsigned long long seen = 0;
+    ++seen;
+    // Sample beyond startup to capture matrices while view bobbing changes.
+    if (seen > 6 && (seen % 2500) != 0) return;
+    static thread_local int samples = 0;
+    if (++samples > 20) return;
+    if (!GLES.glGetUniformIndices || !GLES.glGetActiveUniformsiv) return;
+
+    const GLchar* name = "_uniform_00_00.uCombinedMatrix";
+    GLuint uniform_index = GL_INVALID_INDEX;
+    GLES.glGetUniformIndices(program, 1, &name, &uniform_index);
+    GLint mat_offset = -1;
+    if (uniform_index != GL_INVALID_INDEX) {
+        GLES.glGetActiveUniformsiv(program, 1, &uniform_index, GL_UNIFORM_OFFSET, &mat_offset);
+    }
+    GLint camera_buffer = 0, model_buffer = 0;
+    GLint64 camera_start = 0, model_start = 0, camera_size = 0, model_size = 0;
+    GLES.glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 0, &camera_buffer);
+    GLES.glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, 1, &model_buffer);
+    if (GLES.glGetInteger64i_v) {
+        GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_START, 0, &camera_start);
+        GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_START, 1, &model_start);
+        GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, 0, &camera_size);
+        GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, 1, &model_size);
+    }
+    unsigned char camera[112] = {};
+    unsigned char model[16] = {};
+    const bool got_camera = camera_size >= 112 &&
+        dh_z11_read_gpu_buffer(static_cast<GLuint>(camera_buffer),
+                              static_cast<GLintptr>(camera_start), 112, camera);
+    const bool got_model = model_size >= 16 &&
+        dh_z11_read_gpu_buffer(static_cast<GLuint>(model_buffer),
+                              static_cast<GLintptr>(model_start), 16, model);
+    if (!got_camera || !got_model || mat_offset < 0 || mat_offset > 48) {
+        LOG_W_FORCE("[MG-DH-Z11-UBO] sample=%d captureFailed camera=%d model=%d matrixOffset=%d camBytes=%lld modelBytes=%lld",
+                    samples, got_camera ? 1 : 0, got_model ? 1 : 0, mat_offset,
+                    static_cast<long long>(camera_size), static_cast<long long>(model_size))
+        return;
+    }
+    auto get_float = [](const unsigned char* p, size_t offset) -> float {
+        float f = 0.f;
+        std::memcpy(&f, p + offset, sizeof(float));
+        return f;
+    };
+    const unsigned char* mat = camera + mat_offset;
+    const float p00 = get_float(mat, 0), p11 = get_float(mat, 20);
+    const float p22 = get_float(mat, 40), p23 = get_float(mat, 44);
+    const float p32 = get_float(mat, 56), p33 = get_float(mat, 60);
+    const float frame = get_float(camera, 16), width = get_float(camera, 20), height = get_float(camera, 24);
+    LOG_W_FORCE("[MG-DH-Z11-UBO] sample=%d program=%u frame=%.2f view=%.0fx%.0f camera=%.2f,%.2f,%.2f model=%.2f,%.2f,%.2f matrix=[%.5f %.5f %.5f %.5f %.5f %.5f] finite=%d",
+                samples, program, frame, width, height,
+                get_float(camera,32), get_float(camera,36), get_float(camera,40),
+                get_float(model,0),get_float(model,4),get_float(model,8),
+                p00,p11,p22,p23,p32,p33,
+                std::isfinite(p00) && std::isfinite(p11) && std::isfinite(p22) &&
+                std::isfinite(p23) && std::isfinite(p32) && std::isfinite(p33) ? 1 : 0)
+}
+
+bool dh262_mark_program_for_interface_dump(GLuint program) {
+    static thread_local GLuint seen[32] = {};
+    static thread_local int seen_count = 0;
+    for (int i = 0; i < seen_count; ++i) {
+        if (seen[i] == program) return false;
+    }
+    if (seen_count < 32) seen[seen_count++] = program;
+    return true;
+}
+
+void dh262_dump_program_interface(GLuint program) {
+    GLint linked = 0, attrib_count = 0, uniform_count = 0, block_count = 0;
+    GLES.glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    GLES.glGetProgramiv(program, GL_ACTIVE_ATTRIBUTES, &attrib_count);
+    GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &uniform_count);
+    GLES.glGetProgramiv(program, GL_ACTIVE_UNIFORM_BLOCKS, &block_count);
+    LOG_W_FORCE("[DH26.2 LOD IFACE] program=%u linked=%d activeAttribs=%d activeUniforms=%d uniformBlocks=%d",
+                program, linked, attrib_count, uniform_count, block_count)
+
+    const GLint attr_limit = attrib_count < 32 ? attrib_count : 32;
+    for (GLint i = 0; i < attr_limit; ++i) {
+        GLchar name[256] = {};
+        GLsizei length = 0;
+        GLint size = 0;
+        GLenum type = 0;
+        GLES.glGetActiveAttrib(program, static_cast<GLuint>(i), 255, &length, &size, &type, name);
+        const GLint location = GLES.glGetAttribLocation(program, name);
+        LOG_W_FORCE("[DH26.2 LOD IFACE] attribIndex=%d name=%s location=%d size=%d shaderType=0x%x",
+                    i, name, location, size, type)
+    }
+
+    const GLint uniform_limit = uniform_count < 64 ? uniform_count : 64;
+    for (GLint i = 0; i < uniform_limit; ++i) {
+        GLchar name[256] = {};
+        GLsizei length = 0;
+        GLint size = 0;
+        GLenum type = 0;
+        GLES.glGetActiveUniform(program, static_cast<GLuint>(i), 255, &length, &size, &type, name);
+        const GLint location = GLES.glGetUniformLocation(program, name);
+        LOG_W_FORCE("[DH26.2 LOD IFACE] uniformIndex=%d name=%s location=%d size=%d type=0x%x",
+                    i, name, location, size, type)
+        if (location >= 0 && type == GL_FLOAT_MAT4) {
+            GLfloat m[16] = {};
+            GLES.glGetUniformfv(program, location, m);
+            LOG_W_FORCE("[DH26.2 LOD MAT4] program=%u name=%s loc=%d rows=[%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f] [%.4f %.4f %.4f %.4f]",
+                        program, name, location,
+                        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                        m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15])
+        }
+    }
+
+    const GLint block_limit = block_count < 32 ? block_count : 32;
+    for (GLint i = 0; i < block_limit; ++i) {
+        GLchar name[256] = {};
+        GLsizei length = 0;
+        GLint binding = 0, data_size = 0, real_ubo = 0;
+        GLint64 start = 0, bound_size = 0;
+        GLES.glGetActiveUniformBlockName(program, static_cast<GLuint>(i), 255, &length, name);
+        GLES.glGetActiveUniformBlockiv(program, static_cast<GLuint>(i), GL_UNIFORM_BLOCK_BINDING, &binding);
+        GLES.glGetActiveUniformBlockiv(program, static_cast<GLuint>(i), GL_UNIFORM_BLOCK_DATA_SIZE, &data_size);
+        GLES.glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, static_cast<GLuint>(binding), &real_ubo);
+        if (GLES.glGetInteger64i_v != nullptr) {
+            GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_START, static_cast<GLuint>(binding), &start);
+            GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, static_cast<GLuint>(binding), &bound_size);
+        }
+        LOG_W_FORCE("[DH26.2 LOD UBO] program=%u block=%d name=%s binding=%d dataSize=%d realUbo=%d start=%lld boundSize=%lld",
+                    program, i, name, binding, data_size, real_ubo,
+                    static_cast<long long>(start), static_cast<long long>(bound_size))
+    }
+}
+
+void dh262_dump_lod_render_state(GLuint program, GLint vao, GLint ebo, GLsizei count, GLenum type, GLint basevertex) {
+    static thread_local int state_logs = 0;
+    if (state_logs++ >= 120) return;
+
+    GLint fbo = 0, viewport[4] = {}, scissor[4] = {};
+    GLint depth_func = 0, cull_mode = 0, front_face = 0;
+    GLint blend_src_rgb = 0, blend_dst_rgb = 0, blend_eq_rgb = 0;
+    GLint binding0_buffer = 0, binding0_stride = 0;
+    GLint64 binding0_offset = 0;
+    GLboolean depth_mask = GL_FALSE, color_mask[4] = {};
+
+    GLES.glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+    GLES.glGetIntegerv(GL_VIEWPORT, viewport);
+    GLES.glGetIntegerv(GL_SCISSOR_BOX, scissor);
+    GLES.glGetIntegerv(GL_DEPTH_FUNC, &depth_func);
+    GLES.glGetIntegerv(GL_CULL_FACE_MODE, &cull_mode);
+    GLES.glGetIntegerv(GL_FRONT_FACE, &front_face);
+    GLES.glGetIntegerv(GL_BLEND_SRC_RGB, &blend_src_rgb);
+    GLES.glGetIntegerv(GL_BLEND_DST_RGB, &blend_dst_rgb);
+    GLES.glGetIntegerv(GL_BLEND_EQUATION_RGB, &blend_eq_rgb);
+    GLES.glGetBooleanv(GL_DEPTH_WRITEMASK, &depth_mask);
+    GLES.glGetBooleanv(GL_COLOR_WRITEMASK, color_mask);
+#ifdef GL_VERTEX_BINDING_BUFFER
+    GLES.glGetIntegeri_v(GL_VERTEX_BINDING_BUFFER, 0, &binding0_buffer);
+    GLES.glGetIntegeri_v(GL_VERTEX_BINDING_STRIDE, 0, &binding0_stride);
+    if (GLES.glGetInteger64i_v != nullptr) {
+        GLES.glGetInteger64i_v(GL_VERTEX_BINDING_OFFSET, 0, &binding0_offset);
+    }
+#endif
+
+    const GLboolean depth_test = GLES.glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean cull_face = GLES.glIsEnabled(GL_CULL_FACE);
+    const GLboolean blend = GLES.glIsEnabled(GL_BLEND);
+    const GLboolean scissor_test = GLES.glIsEnabled(GL_SCISSOR_TEST);
+    const GLenum fbo_status = GLES.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+
+    GLint ubo_real[4] = {};
+    GLint64 ubo_start[4] = {}, ubo_size[4] = {};
+    for (GLuint b = 0; b < 4; ++b) {
+        GLES.glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, b, &ubo_real[b]);
+        if (GLES.glGetInteger64i_v != nullptr) {
+            GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_START, b, &ubo_start[b]);
+            GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, b, &ubo_size[b]);
+        }
+    }
+
+    LOG_W_FORCE("[DH26.2 LOD STATE] program=%u vao=%d ebo=%d count=%d type=0x%x base=%d fbo=%d fboStatus=0x%x viewport=%d,%d,%d,%d",
+                program, vao, ebo, count, type, basevertex, fbo, fbo_status,
+                viewport[0], viewport[1], viewport[2], viewport[3])
+    LOG_W_FORCE("[DH26.2 LOD STATE] depth=%d func=0x%x depthMask=%d cull=%d cullMode=0x%x frontFace=0x%x blend=%d blendSrc=0x%x blendDst=0x%x blendEq=0x%x colorMask=%d%d%d%d",
+                depth_test ? 1 : 0, depth_func, depth_mask ? 1 : 0,
+                cull_face ? 1 : 0, cull_mode, front_face,
+                blend ? 1 : 0, blend_src_rgb, blend_dst_rgb, blend_eq_rgb,
+                color_mask[0] ? 1 : 0, color_mask[1] ? 1 : 0,
+                color_mask[2] ? 1 : 0, color_mask[3] ? 1 : 0)
+    LOG_W_FORCE("[DH26.2 LOD STATE] scissor=%d box=%d,%d,%d,%d binding0Buffer=%d binding0Offset=%lld binding0Stride=%d",
+                scissor_test ? 1 : 0, scissor[0], scissor[1], scissor[2], scissor[3],
+                binding0_buffer, static_cast<long long>(binding0_offset), binding0_stride)
+    LOG_W_FORCE("[DH26.2 LOD UBO STATE] b0=%d/%lld/%lld b1=%d/%lld/%lld b2=%d/%lld/%lld b3=%d/%lld/%lld",
+                ubo_real[0], static_cast<long long>(ubo_start[0]), static_cast<long long>(ubo_size[0]),
+                ubo_real[1], static_cast<long long>(ubo_start[1]), static_cast<long long>(ubo_size[1]),
+                ubo_real[2], static_cast<long long>(ubo_start[2]), static_cast<long long>(ubo_size[2]),
+                ubo_real[3], static_cast<long long>(ubo_start[3]), static_cast<long long>(ubo_size[3]))
+}
+
+} // namespace
+
 void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                        GLsizei instancecount, GLint basevertex) {
+
+    static thread_local int dh262_vao_snap_count = 0;
+    GLint dh262_snapshot_ebo = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS) {
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &dh262_snapshot_ebo);
+    }
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_snapshot_ebo >= 100 && dh262_is_lod_packed_signature() && dh262_vao_snap_count++ < 400) {
+        GLint vao = 0, ebo = 0, program = 0;
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+        GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+        LOG_W_FORCE("[DH26.2 VAO SNAP] draw vao=%d ebo=%d program=%d count=%d type=0x%x indices=%p instances=%d base=%d",
+                    vao, ebo, program, count, type, indices, instancecount, basevertex)
+
+        for (GLuint a = 0; a < 8; ++a) {
+            GLint enabled = 0, size = 0, type_i = 0, normalized = 0, integer_i = 0, divisor = 0;
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type_i);
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &normalized);
+#ifdef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_INTEGER, &integer_i);
+#endif
+#ifdef GL_VERTEX_ATTRIB_ARRAY_DIVISOR
+            GLES.glGetVertexAttribiv(a, GL_VERTEX_ATTRIB_ARRAY_DIVISOR, &divisor);
+#endif
+            if (enabled || a < 4) {
+                LOG_W_FORCE("[DH26.2 VAO SNAP] attr=%u en=%d size=%d type=0x%x norm=%d int=%d divisor=%d",
+                            a, enabled, size, type_i, normalized, integer_i, divisor)
+            }
+        }
+    }
+
+
+    static thread_local int dh262_deibv = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_deibv++ < 80) {
+        GLint vao = 0, ebo = 0;
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+        LOG_W_FORCE("[DH26.2 DRAW] glDrawElementsInstancedBaseVertex mode=0x%x count=%d type=0x%x indices=%p instances=%d base=%d vao=%d ebo=%d",
+                    mode, count, type, indices, instancecount, basevertex, vao, ebo)
+    }
     LOG()
     LOG_D("glDrawElementsInstancedBaseVertex, mode: %d, count: %d, type: %d, instancecount: %d, basevertex: %d", mode,
           count, type, instancecount, basevertex)
     prepareForDraw();
+    // MG-DH-Z6 comparison probe: record the REAL GLES state at an actual
+    // Distant Horizons packed-terrain draw.  This is observation-only: it
+    // never changes the depth function, framebuffer or shader inputs.
+    // Sample both Adreno and Mali to distinguish backend differences.
+    static thread_local unsigned long long z6_basevertex_calls = 0;
+    static thread_local unsigned long long z6_matching_calls = 0;
+    static thread_local int z6_reports = 0;
+    ++z6_basevertex_calls;
+    if (z6_basevertex_calls == 3000 && z6_matching_calls == 0) {
+        LOG_W_FORCE("[MG-DH-Z6] warning: 3000 instanced-basevertex draws without a packed DH signature; alternate draw path suspected")
+    }
+    if (z6_reports < 18 && dh262_is_lod_packed_signature()) {
+        ++z6_matching_calls;
+        if (z6_matching_calls <= 3 || (z6_matching_calls % 240 == 0)) {
+            ++z6_reports;
+            const GLubyte* deviceName = GLES.glGetString(GL_RENDERER);
+            const char* device = deviceName ? reinterpret_cast<const char*>(deviceName) : "unknown";
+            GLint currentProgram = 0, vao = 0, ebo = 0;
+            GLint drawFbo = 0, readFbo = 0, depthFunc = 0, clipDepth = -1;
+            GLint viewport[4] = {}, scissor[4] = {};
+            GLfloat clearDepth = -1.0f, depthRange[2] = {-1.0f, -1.0f};
+            GLboolean depthMask = GL_FALSE;
+            GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+            GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+            GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &ebo);
+            GLES.glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+            GLES.glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+            GLES.glGetIntegerv(GL_DEPTH_FUNC, &depthFunc);
+            GLES.glGetIntegerv(GL_VIEWPORT, viewport);
+            GLES.glGetIntegerv(GL_SCISSOR_BOX, scissor);
+            GLES.glGetFloatv(GL_DEPTH_CLEAR_VALUE, &clearDepth);
+            GLES.glGetFloatv(GL_DEPTH_RANGE, depthRange);
+            GLES.glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+            // GL_CLIP_DEPTH_MODE is invalid on drivers without EXT_clip_control.
+            static thread_local int z6_has_ext = -1;
+            if (z6_has_ext < 0) {
+                z6_has_ext = 0;
+                if (GLES.glGetStringi) {
+                    GLint extensionCount = 0;
+                    GLES.glGetIntegerv(GL_NUM_EXTENSIONS, &extensionCount);
+                    for (GLint extIndex = 0; extIndex < extensionCount; ++extIndex) {
+                        const GLubyte* extName = GLES.glGetStringi(GL_EXTENSIONS, static_cast<GLuint>(extIndex));
+                        if (extName && std::strcmp(reinterpret_cast<const char*>(extName), "GL_EXT_clip_control") == 0) {
+                            z6_has_ext = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (z6_has_ext) GLES.glGetIntegerv(GL_CLIP_DEPTH_MODE, &clipDepth);
+            const GLenum fboStatus = GLES.glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+            LOG_W_FORCE("[MG-DH-Z6] gpu=%s calls=%llu match=%llu program=%d vao=%d ebo=%d prim=0x%x count=%d instances=%d base=%d", 
+                        device, z6_basevertex_calls, z6_matching_calls, currentProgram, vao, ebo, mode, count, instancecount, basevertex)
+            LOG_W_FORCE("[MG-DH-Z6] depthTest=%d func=0x%x write=%d clear=%.6g range=%.6g,%.6g extClip=%d actualClip=0x%x", 
+                        GLES.glIsEnabled(GL_DEPTH_TEST) == GL_TRUE ? 1 : 0, depthFunc, depthMask == GL_TRUE ? 1 : 0,
+                        clearDepth, depthRange[0], depthRange[1], z6_has_ext, clipDepth)
+            LOG_W_FORCE("[MG-DH-Z6] drawFBO=%d readFBO=%d status=0x%x viewport=%d,%d,%d,%d scissorEnabled=%d scissor=%d,%d,%d,%d cull=%d blend=%d",
+                        drawFbo, readFbo, fboStatus, viewport[0],viewport[1],viewport[2],viewport[3],
+                        GLES.glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE ? 1 : 0,
+                        scissor[0],scissor[1],scissor[2],scissor[3],
+                        GLES.glIsEnabled(GL_CULL_FACE) == GL_TRUE ? 1 : 0,
+                        GLES.glIsEnabled(GL_BLEND) == GL_TRUE ? 1 : 0)
+            for (GLuint block = 0; block < 3; ++block) {
+                GLint uboId = 0;
+                GLint64 start = 0, size = 0;
+                GLES.glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, block, &uboId);
+                if (GLES.glGetInteger64i_v) {
+                    GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_START, block, &start);
+                    GLES.glGetInteger64i_v(GL_UNIFORM_BUFFER_SIZE, block, &size);
+                }
+                LOG_W_FORCE("[MG-DH-Z6] UBO binding=%u buffer=%d offset=%lld size=%lld", block,
+                            uboId, static_cast<long long>(start), static_cast<long long>(size))
+            }
+            static thread_local GLuint z6_programs[12] = {};
+            static thread_local int z6_seen_count = 0;
+            bool newProgram = true;
+            for (int i = 0; i < z6_seen_count; ++i) {
+                if (z6_programs[i] == static_cast<GLuint>(currentProgram)) newProgram = false;
+            }
+            if (newProgram && z6_seen_count < 12) {
+                z6_programs[z6_seen_count++] = static_cast<GLuint>(currentProgram);
+                // Existing helper dumps active program uniforms, std140 block
+                // names, binding points and actual per-binding UBO ranges.
+                dh262_dump_program_interface(static_cast<GLuint>(currentProgram));
+            }
+        }
+    }
+    // Program-specific DH 26.2 LOD diagnostics. The packed 16-byte format
+    // (ushort3, ushort1, rgba8, ubyte, ubyte, ushort) is distinctive enough to
+    // avoid consuming the log budget on ordinary Minecraft world/UI draws.
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_is_lod_packed_signature()) {
+        GLint dh262_lod_program = 0, dh262_lod_vao = 0, dh262_lod_ebo = 0;
+        GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &dh262_lod_program);
+        GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &dh262_lod_vao);
+        GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &dh262_lod_ebo);
+        if (dh262_mark_program_for_interface_dump(static_cast<GLuint>(dh262_lod_program))) {
+            dh262_dump_program_interface(static_cast<GLuint>(dh262_lod_program));
+        }
+        dh262_dump_lod_render_state(static_cast<GLuint>(dh262_lod_program), dh262_lod_vao,
+                                    dh262_lod_ebo, count, type, basevertex);
+    }
+    // Z11: GPU-side face-culling isolation.  This is distinct from DH's
+    // CPU frustum culling; it restores GL_CULL_FACE at scope exit.
+    const bool z11_terrain = dh_z11_on_adreno() && dh262_is_lod_packed_signature();
+    const bool z11_capture = mg_modern_depth_compat_enabled() && dh262_is_lod_packed_signature();
+    if (z11_capture) {
+        GLint lod_program = 0;
+        GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &lod_program);
+        dh_z11_probe_ubo(static_cast<GLuint>(lod_program));
+    }
+    dh_z11_gpu_cull_guard_t z11_cull_guard(z11_terrain);
+
     if (mg_restart_needs_rewrite(type) &&
         mg_draw_elements_restart(mode, count, type, indices, basevertex, instancecount))
         return;
     restart_guard_t guard(type);
     if (GLES.glDrawElementsInstancedBaseVertex) {
         GLES.glDrawElementsInstancedBaseVertex(mode, count, type, indices, instancecount, basevertex);
+        GLint dh262_late_ebo = 0;
+        if (DROIDBRIDGE_GL_DIAGNOSTICS) {
+            GLES.glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &dh262_late_ebo);
+        }
+        if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_late_ebo >= 100 && dh262_is_lod_packed_signature()) {
+            static thread_local int dh262_late_draw_log = 0;
+            if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_late_draw_log++ < 2000) {
+                GLint dh262_late_vao = 0, dh262_late_program = 0;
+                GLES.glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &dh262_late_vao);
+                GLES.glGetIntegerv(GL_CURRENT_PROGRAM, &dh262_late_program);
+                GLenum err = GLES.glGetError();
+                LOG_W_FORCE("[DH26.2 LOD DRAW] vao=%d eboReal=%d program=%d count=%d type=0x%x indices=%p instances=%d base=%d glesError=0x%x",
+                            dh262_late_vao, dh262_late_ebo, dh262_late_program,
+                            count, type, indices, instancecount, basevertex, err)
+            }
+        }
     } else if (basevertex == 0) {
         GLES.glDrawElementsInstanced(mode, count, type, indices, instancecount);
     } else {

@@ -11,6 +11,9 @@
 #include <memory>
 #include <ska/flat_hash_map.hpp>
 #include <array>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
 #include "texture.h"
 
 #define DEBUG 0
@@ -37,11 +40,23 @@ static GLint maxArrayId = 0;
 
 namespace {
 
+// Desktop GL applications commonly create small buffer objects on one target
+// and later bind the same object as a UBO. GLES drivers are stricter about the
+// std140 tail padding implied by GL_UNIFORM_BLOCK_DATA_SIZE. Keep the app's
+// logical size unchanged, but give the real GLES object 16-byte tail padding so
+// an aligned UBO range can safely expose that padding.
+static inline GLsizeiptr mg_align16(GLsizeiptr size) {
+    if (size <= 0) return size;
+    return (size + 15) & ~static_cast<GLsizeiptr>(15);
+}
+
 struct buffer_group_state_t { // shared across a share group
     std::vector<GLuint> gen_buffers;
     std::vector<char> gen_buffer_exists;
     std::vector<GLuint> free_buffer_ids;
     std::vector<size_t> buffer_datasize;
+    // Physical GLES allocation, which can be larger than the app-visible GL size.
+    std::vector<size_t> buffer_physicalsize;
 };
 
 struct buffer_ctx_state_t { // private to one context
@@ -97,6 +112,7 @@ void mg_buffer_forget_context(unsigned long long ctx_id) {
 #define g_gen_buffer_exists (g_bg->gen_buffer_exists)
 #define g_free_buffer_ids (g_bg->free_buffer_ids)
 #define g_buffer_datasize (g_bg->buffer_datasize)
+#define g_buffer_physicalsize (g_bg->buffer_physicalsize)
 #define g_gen_arrays (g_bc->gen_arrays)
 #define g_gen_array_exists (g_bc->gen_array_exists)
 #define g_free_array_ids (g_bc->free_array_ids)
@@ -126,6 +142,7 @@ static inline int ensure_buffer_capacity(GLuint id) {
         g_gen_buffers.resize(id + 1, 0);
         g_gen_buffer_exists.resize(id + 1, 0);
         if (g_buffer_datasize.size() <= (size_t)id) g_buffer_datasize.resize(id + 1, 0);
+        if (g_buffer_physicalsize.size() <= (size_t)id) g_buffer_physicalsize.resize(id + 1, 0);
     }
     return 0;
 }
@@ -147,6 +164,7 @@ GLuint gen_buffer() {
         g_gen_buffers[id] = 0;
         g_gen_buffer_exists[id] = 1;
         g_buffer_datasize[id] = 0;
+        g_buffer_physicalsize[id] = 0;
         if (id > (GLuint)maxBufferId) maxBufferId = id;
         return id;
     }
@@ -155,6 +173,7 @@ GLuint gen_buffer() {
     g_gen_buffers[maxBufferId] = 0;
     g_gen_buffer_exists[maxBufferId] = 1;
     g_buffer_datasize[maxBufferId] = 0;
+    g_buffer_physicalsize[maxBufferId] = 0;
     return (GLuint)maxBufferId;
 }
 
@@ -174,6 +193,7 @@ void remove_buffer(GLuint key) {
         g_gen_buffer_exists[key] = 0;
         g_gen_buffers[key] = 0;
         if (key < g_buffer_datasize.size()) g_buffer_datasize[key] = 0;
+        if (key < g_buffer_physicalsize.size()) g_buffer_physicalsize[key] = 0;
         g_free_buffer_ids.push_back(key);
     }
 }
@@ -200,6 +220,16 @@ void update_vao_ibo_binding(GLuint vao, GLuint ibo) {
 void set_buffer_data_size(GLuint buffer, size_t size) {
     ensure_buffer_capacity(buffer);
     g_buffer_datasize[buffer] = size;
+}
+
+static void set_buffer_physical_size(GLuint buffer, size_t size) {
+    if (buffer == 0) return;
+    ensure_buffer_capacity(buffer);
+    g_buffer_physicalsize[buffer] = size;
+}
+
+static size_t get_buffer_physical_size(GLuint buffer) {
+    return buffer < g_buffer_physicalsize.size() ? g_buffer_physicalsize[buffer] : 0;
 }
 
 size_t get_buffer_data_size(GLuint buffer) {
@@ -539,6 +569,14 @@ void glBindBuffer(GLenum target, GLuint buffer) {
     }
     LOG_D("glBindBuffer: %d -> %d", buffer, real_buffer)
     GLES.glBindBuffer(target, real_buffer);
+    if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+        static thread_local int dh262_bind_buffer_log = 0;
+        if (DROIDBRIDGE_GL_DIAGNOSTICS && real_buffer >= 100 && dh262_bind_buffer_log++ < 1200) {
+            GLenum err = GLES.glGetError();
+            LOG_W_FORCE("[DH26.2 LATE BUF] glBindBuffer target=0x%x fake=%u real=%u glesError=0x%x",
+                        target, buffer, real_buffer, err)
+        }
+    }
     CHECK_GL_ERROR
 }
 
@@ -560,7 +598,57 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
         modify_buffer(buffer, real_buffer);
         CHECK_GL_ERROR
     }
-    GLES.glBindBufferRange(target, index, real_buffer, offset, size);
+    // MG-DH-Z8: Minecraft 26.2+ / DH 3.3 Blaze3D binds std140 vec3
+    // (12 bytes) and fragment-parameters (24 bytes) as a range shorter than
+    // GL_UNIFORM_BLOCK_DATA_SIZE (16 and 32 respectively). The real GLES
+    // allocation has 16-byte tail padding when created with glBufferData()
+    // or when small immutable storage has been padded below. Forwarding the
+    // shorter range otherwise hides that padding
+    // from stricter Adreno drivers. Only extend when the *tracked real*
+    // allocation contains every byte; never widen an immutable/undersized
+    // store or touch older Minecraft/Mali/GLES state.
+    GLsizeiptr real_range_size = size;
+    bool z7_candidate = false;
+    bool z7_enabled = false;
+    const size_t physical_bytes = get_buffer_physical_size(buffer);
+    if (target == GL_UNIFORM_BUFFER && offset == 0 &&
+        ((index == 1 && size == 12) || (index == 2 && size == 24))) {
+        const char* modern = std::getenv("DROIDBRIDGE_MOBILEGLUES_ZERO_TO_ONE_DEPTH");
+        const char* disabled = std::getenv("MG_DH_DISABLE_Z7_UBO_PAD");
+        const char* renderer = GLES.glGetString != nullptr
+            ? reinterpret_cast<const char*>(GLES.glGetString(GL_RENDERER)) : nullptr;
+        z7_candidate = true;
+        z7_enabled = modern && modern[0] != '\0' && std::strcmp(modern, "0") != 0 &&
+            !(disabled && std::strcmp(disabled, "1") == 0) &&
+            renderer && std::strstr(renderer, "Adreno");
+        if (z7_enabled) {
+            const GLsizeiptr padded = mg_align16(size);
+            if (static_cast<size_t>(offset + padded) <= physical_bytes) {
+                real_range_size = padded;
+            }
+        }
+    }
+    GLES.glBindBufferRange(target, index, real_buffer, offset, real_range_size);
+    if (z7_candidate && z7_enabled) {
+        static thread_local unsigned int z7_reports = 0;
+        ++z7_reports;
+        if (z7_reports <= 18 || (z7_reports < 5000 && z7_reports % 512 == 0)) {
+            const GLenum result = GLES.glGetError();
+            LOG_W_FORCE("[MG-DH-Z8-RANGE] UBO idx=%u fake=%u real=%u logicalSize=%lld allocated=%zu boundBefore=%lld boundAfter=%lld glesError=0x%x",
+                        index, buffer, real_buffer, static_cast<long long>(get_buffer_data_size(buffer)),
+                        physical_bytes, static_cast<long long>(size),
+                        static_cast<long long>(real_range_size), result)
+        }
+    }
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && target == GL_UNIFORM_BUFFER) {
+        static thread_local int ubo_range_log_count = 0;
+        if (ubo_range_log_count < 24) {
+            LOG_W_FORCE("[DH26.2 UBO] glBindBufferRange index=%u fake=%u real=%u offset=%lld size=%lld",
+                        index, buffer, real_buffer, static_cast<long long>(offset),
+                        static_cast<long long>(real_range_size))
+            ++ubo_range_log_count;
+        }
+    }
     CHECK_GL_ERROR
 }
 
@@ -590,6 +678,12 @@ void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
 }
 
 void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) {
+    static thread_local int dh262_bind_vb_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_bind_vb_log++ < 160) {
+        LOG_W_FORCE("[DH26.2 VAO] glBindVertexBuffer binding=%u fakeBuffer=%u offset=%lld stride=%d",
+                    bindingindex, buffer, static_cast<long long>(offset), stride)
+    }
+
     LOG()
     LOG_D("glBindVertexBuffer, bindingindex = %d, buffer = %d, offset = %p, stride = %i", bindingindex, buffer, offset,
           stride)
@@ -607,6 +701,12 @@ void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLs
         CHECK_GL_ERROR
     }
     GLES.glBindVertexBuffer(bindingindex, real_buffer, offset, stride);
+    static thread_local int dh262_bind_vertex_real_log = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && real_buffer >= 100 && dh262_bind_vertex_real_log++ < 1200) {
+        GLenum err = GLES.glGetError();
+        LOG_W_FORCE("[DH26.2 LATE BUF] glBindVertexBuffer binding=%u fake=%u real=%u offset=%lld stride=%d glesError=0x%x",
+                    bindingindex, buffer, real_buffer, static_cast<long long>(offset), stride, err)
+    }
     CHECK_GL_ERROR
 }
 
@@ -1016,8 +1116,27 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
     LOG_D("glBufferData, target = %s, size = %d, data = 0x%x, usage = %s", glEnumToString(target), size, data,
           glEnumToString(usage))
     borrowed_target_t t(target);
-    GLES.glBufferData(t.target, size, data, usage);
-    set_buffer_data_size(find_bound_buffer_by_target(target), size);
+    const GLuint fake = find_bound_buffer_by_target(target);
+    const GLuint real = find_real_buffer(fake);
+    const GLsizeiptr physical_size = mg_align16(size);
+    const void* physical_data = data;
+    std::vector<unsigned char> padded_data;
+    if (data != nullptr && physical_size > size) {
+        padded_data.resize(static_cast<size_t>(physical_size), 0);
+        std::memcpy(padded_data.data(), data, static_cast<size_t>(size));
+        physical_data = padded_data.data();
+    }
+    GLES.glBufferData(t.target, physical_size, physical_data, usage);
+    if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+        static thread_local int dh262_buffer_data_log = 0;
+        if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_buffer_data_log++ < 200) {
+            GLenum err = GLES.glGetError();
+            LOG_W_FORCE("[DH26.2 BUF] glBufferData target=0x%x fake=%u real=%u size=%lld data=%p usage=0x%x glesError=0x%x",
+                        target, fake, real, static_cast<long long>(size), data, usage, err)
+        }
+    }
+    set_buffer_data_size(fake, size);
+    set_buffer_physical_size(fake, physical_size > 0 ? static_cast<size_t>(physical_size) : 0);
     CHECK_GL_ERROR
 }
 
@@ -1027,13 +1146,32 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
     LOG()
     LOG_D("glBufferSubData, target = %s, offset = %p, size = %zi", glEnumToString(target), (void*)offset, size)
     borrowed_target_t t(target);
+    const GLuint fake = find_bound_buffer_by_target(target);
+    const GLuint real = find_real_buffer(fake);
     GLES.glBufferSubData(t.target, offset, size, data);
+    if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+        static thread_local int dh262_buffer_subdata_log = 0;
+        if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_buffer_subdata_log++ < 240) {
+            GLenum err = GLES.glGetError();
+            LOG_W_FORCE("[DH26.2 BUF] glBufferSubData target=0x%x fake=%u real=%u offset=%lld size=%lld data=%p glesError=0x%x",
+                        target, fake, real, static_cast<long long>(offset),
+                        static_cast<long long>(size), data, err)
+        }
+    }
     CHECK_GL_ERROR
 }
 
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
     LOG()
     LOG_D("glGetBufferParameteriv, target = %s, pname = %s", glEnumToString(target), glEnumToString(pname))
+    if (pname == GL_BUFFER_SIZE) {
+        const GLuint fake = find_bound_buffer_by_target(target);
+        const size_t logical_size = get_buffer_data_size(fake);
+        if (logical_size > 0) {
+            *params = static_cast<GLint>(logical_size);
+            return;
+        }
+    }
     borrowed_target_t t(target);
     GLES.glGetBufferParameteriv(t.target, pname, params);
     CHECK_GL_ERROR
@@ -1089,10 +1227,32 @@ extern "C"
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     LOG()
-    if (global_settings.buffer_coherent_as_flush) access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
-    //    access |= GL_MAP_UNSYNCHRONIZED_BIT;
+
+    if (global_settings.buffer_coherent_as_flush)
+        access &= ~GL_MAP_FLUSH_EXPLICIT_BIT;
+
+    static thread_local int ubo_map_log_count = 0;
+    if (DROIDBRIDGE_GL_DIAGNOSTICS && target == GL_UNIFORM_BUFFER && ubo_map_log_count < 24) {
+        LOG_W_FORCE("[DH26.2 UBO] glMapBufferRange offset=%lld length=%lld access=0x%x explicit=%d",
+                    static_cast<long long>(offset), static_cast<long long>(length), access,
+                    (access & GL_MAP_FLUSH_EXPLICIT_BIT) ? 1 : 0)
+        ++ubo_map_log_count;
+    }
+
     borrowed_target_t t(target);
-    return GLES.glMapBufferRange(t.target, offset, length, access);
+    const GLuint fake = find_bound_buffer_by_target(target);
+    const GLuint real = find_real_buffer(fake);
+    void* ptr = GLES.glMapBufferRange(t.target, offset, length, access);
+    if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+        static thread_local int dh262_map_vertex_log = 0;
+        if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_map_vertex_log++ < 240) {
+            GLenum err = GLES.glGetError();
+            LOG_W_FORCE("[DH26.2 BUF] glMapBufferRange target=0x%x fake=%u real=%u offset=%lld length=%lld access=0x%x ptr=%p glesError=0x%x",
+                        target, fake, real, static_cast<long long>(offset),
+                        static_cast<long long>(length), access, ptr, err)
+        }
+    }
+    return ptr;
 }
 
 GLboolean glUnmapBuffer(GLenum target) {
@@ -1113,9 +1273,55 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
             ((flags & GL_MAP_PERSISTENT_BIT) != 0 || (flags & GL_DYNAMIC_STORAGE_BIT) != 0))
             flags |= (GL_MAP_WRITE_BIT | GL_MAP_COHERENT_BIT | GL_MAP_PERSISTENT_BIT);
         borrowed_target_t t(target);
-        GLES.glBufferStorageEXT(t.target, size, data, flags);
+        const GLuint fake = find_bound_buffer_by_target(target);
+        const GLuint real = find_real_buffer(fake);
+        // Some desktop GL callers store only the populated bytes of a std140
+        // block (for example 12 for a vec3 or 24 for a 32-byte block). The
+        // GLES driver must see a fully sized backing store when that buffer is
+        // later bound as a uniform block. This also covers DSA, which routes
+        // immutable buffer creation through GL_ARRAY_BUFFER.
+        GLsizeiptr physical_size = size;
+        const void* physical_data = data;
+        std::vector<unsigned char> padded_storage;
+        bool z8_pad_storage = false;
+        if (size == 12 || size == 24) {
+            const char* modern = std::getenv("DROIDBRIDGE_MOBILEGLUES_ZERO_TO_ONE_DEPTH");
+            const char* disabled = std::getenv("MG_DH_DISABLE_Z8_UBO_STORAGE");
+            const char* renderer = GLES.glGetString
+                ? reinterpret_cast<const char*>(GLES.glGetString(GL_RENDERER)) : nullptr;
+            z8_pad_storage = modern && modern[0] && std::strcmp(modern, "0") != 0 &&
+                !(disabled && std::strcmp(disabled, "1") == 0) &&
+                renderer && std::strstr(renderer, "Adreno") != nullptr;
+            if (z8_pad_storage) {
+                physical_size = mg_align16(size);
+                if (data && physical_size > size) {
+                    padded_storage.resize(static_cast<size_t>(physical_size), 0);
+                    std::memcpy(padded_storage.data(), data, static_cast<size_t>(size));
+                    physical_data = padded_storage.data();
+                }
+            }
+        }
+        GLES.glBufferStorageEXT(t.target, physical_size, physical_data, flags);
+        if (z8_pad_storage) {
+            static thread_local unsigned z8_storage_report_count = 0;
+            if (++z8_storage_report_count <= 24) {
+                const GLenum err = GLES.glGetError();
+                LOG_W_FORCE("[MG-DH-Z8-STORAGE] target=0x%x fake=%u real=%u logical=%lld physical=%lld flags=0x%x result=0x%x",
+                            target, fake, real, static_cast<long long>(size),
+                            static_cast<long long>(physical_size), flags, err)
+            }
+        }
+        if (target == GL_ARRAY_BUFFER || target == GL_ELEMENT_ARRAY_BUFFER) {
+            static thread_local int dh262_storage_log = 0;
+            if (DROIDBRIDGE_GL_DIAGNOSTICS && dh262_storage_log++ < 200) {
+                GLenum err = GLES.glGetError();
+                LOG_W_FORCE("[DH26.2 BUF] glBufferStorage target=0x%x fake=%u real=%u size=%lld physical=%lld data=%p flags=0x%x glesError=0x%x",
+                            target, fake, real, static_cast<long long>(size), static_cast<long long>(physical_size), data, flags, err)
+            }
+        }
         // Allocates storage just as glBufferData does, so it owes the same record.
-        set_buffer_data_size(find_bound_buffer_by_target(target), size);
+        set_buffer_data_size(fake, size);
+        set_buffer_physical_size(fake, physical_size > 0 ? static_cast<size_t>(physical_size) : 0);
     }
     CHECK_GL_ERROR
 }

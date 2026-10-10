@@ -8,6 +8,7 @@
 #include "../includes.h"
 #include <GL/gl.h>
 #include <cmath>
+#include <cstdlib>
 #include "glcorearb.h"
 #include "log.h"
 #include "../gles/loader.h"
@@ -23,12 +24,92 @@
 
 static GLclampd currentDepthValue;
 
+thread_local GLenum mg_clip_origin = GL_LOWER_LEFT;
+thread_local GLenum mg_clip_depth_mode = GL_NEGATIVE_ONE_TO_ONE;
+
+bool mg_modern_depth_compat_enabled() {
+    const char* v = std::getenv("DROIDBRIDGE_MOBILEGLUES_ZERO_TO_ONE_DEPTH");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 #include "framebuffer.h"
 
 void glClearDepth(GLclampd depth) {
     LOG()
     currentDepthValue = depth;
     GLES.glClearDepthf((float)depth);
+    CHECK_GL_ERROR
+}
+
+void glDepthRange(GLclampd near_val, GLclampd far_val) {
+    LOG()
+    // Keep 26.1.2 and older on MobileGlues' original behavior. Minecraft 26.2+
+    // changed to the modern reverse-Z path and is opted in explicitly by DroidBridge.
+    if (!mg_modern_depth_compat_enabled()) return;
+
+    GLES.glDepthRangef(static_cast<GLfloat>(near_val), static_cast<GLfloat>(far_val));
+    CHECK_GL_ERROR
+}
+
+namespace {
+using mg_clip_control_proc = void (*)(GLenum origin, GLenum depth);
+using mg_egl_generic_proc = void (*)();
+using mg_egl_get_proc_address_proc = mg_egl_generic_proc (*)(const char*);
+
+mg_clip_control_proc resolve_gles_clip_control() {
+    // Resolve from the GLES implementation first so we never recurse into
+    // MobileGlues' own exported desktop symbol.
+    mg_clip_control_proc fn = nullptr;
+    if (gles != nullptr) {
+        fn = reinterpret_cast<mg_clip_control_proc>(proc_address(gles, "glClipControlEXT"));
+    }
+
+    // Android vendors are allowed to expose extension entry points only through
+    // eglGetProcAddress. Ask the backend EGL directly, not MobileGlues'
+    // eglGetProcAddress wrapper, to keep the call in the same driver/context.
+    if (fn == nullptr && egl != nullptr) {
+        auto backend_get_proc = reinterpret_cast<mg_egl_get_proc_address_proc>(
+            proc_address(egl, "eglGetProcAddress"));
+        if (backend_get_proc != nullptr) {
+            fn = reinterpret_cast<mg_clip_control_proc>(backend_get_proc("glClipControlEXT"));
+        }
+    }
+    return fn;
+}
+} // namespace
+
+void glClipControl(GLenum origin, GLenum depth) {
+    LOG()
+
+    // Pre-26.2 MobileGlues historically exported this as a no-op. Preserve that
+    // behavior so older working versions cannot inherit 26.2 reverse-Z state.
+    if (!mg_modern_depth_compat_enabled()) return;
+
+    if ((origin != GL_LOWER_LEFT && origin != GL_UPPER_LEFT) ||
+        (depth != GL_NEGATIVE_ONE_TO_ONE && depth != GL_ZERO_TO_ONE)) {
+        mg_set_gl_error(GL_INVALID_ENUM);
+        return;
+    }
+
+    static mg_clip_control_proc clip_control = resolve_gles_clip_control();
+    if (clip_control == nullptr) {
+        if (origin == GL_LOWER_LEFT && depth == GL_NEGATIVE_ONE_TO_ONE) {
+            mg_clip_origin = origin;
+            mg_clip_depth_mode = depth;
+            return;
+        }
+        mg_set_gl_error(GL_INVALID_OPERATION);
+        return;
+    }
+
+    clip_control(origin, depth);
+    mg_clip_origin = origin;
+    mg_clip_depth_mode = depth;
+    static thread_local int db_clip_log = 0;
+    if (db_clip_log++ < 16) {
+        LOG_W_FORCE("[DroidBridge modern depth] glClipControl origin=0x%x depth=0x%x -> GL_EXT_clip_control",
+                    origin, depth)
+    }
     CHECK_GL_ERROR
 }
 
